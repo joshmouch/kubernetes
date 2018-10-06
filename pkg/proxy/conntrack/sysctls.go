@@ -218,6 +218,10 @@ func (rct realConntrackConfigurer) GetHashsize(_ context.Context) (int, error) {
 }
 
 func (rct realConntrackConfigurer) SetHashsize(ctx context.Context, value int) error {
-	klog.FromContext(ctx).Info("Setting conntrack hashsize", "conntrackHashsize", value)
-	return os.WriteFile("/sys/module/nf_conntrack/parameters/hashsize", []byte(strconv.Itoa(value)), 0640)
+	logger := klog.FromContext(ctx)
+	logger.Info("Setting conntrack hashsize", "conntrackHashsize", value)
+	if err := os.WriteFile("/sys/module/nf_conntrack/parameters/hashsize", []byte(strconv.Itoa(value)), 0640); err != nil {
+		logger.Error(err, "Failed to set conntrack hashsize", "conntrackHashsize", value)
+	}
+	return nil
 }
