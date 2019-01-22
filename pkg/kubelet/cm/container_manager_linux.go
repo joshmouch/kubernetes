@@ -169,7 +169,7 @@ func validateSystemRequirements(logger klog.Logger, mountUtil mount.Interface) (
 		return f, nil
 	}
 
-	expectedCgroups := sets.New("cpu", "cpuacct", "cpuset", "memory")
+	expectedCgroups := sets.New("cpu", "cpuacct", "memory")
 	for _, mountPoint := range mountPoints {
 		if mountPoint.Type == cgroupMountType {
 			for _, opt := range mountPoint.Opts {
