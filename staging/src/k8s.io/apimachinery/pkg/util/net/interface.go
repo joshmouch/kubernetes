@@ -445,7 +445,10 @@ func chooseHostInterfaceFromRoute(logger klog.Logger, routes []Route, nw network
 			if route.Family != family {
 				continue
 			}
-			logger.V(4).Info("Default route transits interface", "interface", route.Interface)
+			if strings.HasPrefix(route.Interface, "flannel") || strings.HasPrefix(route.Interface, "cni") {
+				continue
+			}
+			klog.V(4).Infof("Default route transits interface %q", route.Interface)
 			finalIP, err := getIPFromInterface(logger, route.Interface, family, nw)
 			if err != nil {
 				return nil, err
