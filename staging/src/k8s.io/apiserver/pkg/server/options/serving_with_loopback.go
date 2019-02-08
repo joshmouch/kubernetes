@@ -72,12 +72,15 @@ func (s *SecureServingOptionsWithLoopback) applyTo(secureServingInfo **server.Se
 		return nil
 	}
 
+	// Set a validity period of approximately 3 years for the loopback certificate
+	// to avoid kube-apiserver disruptions due to certificate expiration.
+	// When this certificate expires, restarting kube-apiserver will automatically
+	// regenerate a new certificate with fresh validity dates.
+	// maxAge := (3*365 + 1) * 24 * time.Hour
+
 	// create self-signed cert+key with the fake server.LoopbackClientServerNameOverride and
 	// let the server return it when the loopback client connects.
-	certPem, keyPem, err := certutil.GenerateSelfSignedCertKeyWithOptions(certutil.SelfSignedCertKeyOptions{
-		Host:   server.LoopbackClientServerNameOverride,
-		MaxAge: maxAge,
-	})
+	certPem, keyPem, err := certutil.GenerateSelfSignedCertKeyWithFixtures(server.LoopbackClientServerNameOverride, nil, nil, s.SecureServingOptions.ServerCert.CertDirectory)
 	if err != nil {
 		return fmt.Errorf("failed to generate self-signed certificate for loopback connection: %v", err)
 	}
