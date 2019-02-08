@@ -54,6 +54,8 @@ type nodeStrategy struct {
 // objects.
 var Strategy = nodeStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
 
+var DisableProxyHostnameCheck = false
+
 // NamespaceScoped is false for nodes.
 func (nodeStrategy) NamespaceScoped() bool {
 	return false
@@ -271,6 +273,9 @@ func ResourceLocation(getter ResourceGetter, connection client.ConnectionInfoGet
 }
 
 func isProxyableHostname(ctx context.Context, hostname string) error {
+	if DisableProxyHostnameCheck {
+		return nil
+	}
 	resp, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
 	if err != nil {
 		return err
