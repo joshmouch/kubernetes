@@ -18,13 +18,13 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"os"
 
 	"github.com/spf13/cobra/doc"
 	"github.com/spf13/pflag"
+	"k8s.io/apiserver/pkg/server"
 	"k8s.io/kubernetes/cmd/genutils"
 	apiservapp "k8s.io/kubernetes/cmd/kube-apiserver/app"
 	cmapp "k8s.io/kubernetes/cmd/kube-controller-manager/app"
@@ -46,7 +46,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
 	outDir, err := genutils.OutDir(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to get output directory: %v\n", err)
@@ -56,7 +55,7 @@ func main() {
 	switch module {
 	case "kube-apiserver":
 		// generate docs for kube-apiserver
-		apiserver := apiservapp.NewAPIServerCommand()
+		apiserver := apiservapp.NewAPIServerCommand(server.SetupSignalHandler())
 		doc.GenMarkdownTree(apiserver, outDir)
 	case "kube-controller-manager":
 		// generate docs for kube-controller-manager
@@ -68,11 +67,11 @@ func main() {
 		doc.GenMarkdownTree(proxy, outDir)
 	case "kube-scheduler":
 		// generate docs for kube-scheduler
-		scheduler := schapp.NewSchedulerCommand()
+		scheduler := schapp.NewSchedulerCommand(server.SetupSignalHandler())
 		doc.GenMarkdownTree(scheduler, outDir)
 	case "kubelet":
 		// generate docs for kubelet
-		kubelet := kubeletapp.NewKubeletCommand(ctx)
+		kubelet := kubeletapp.NewKubeletCommand(server.SetupSignalContext())
 		doc.GenMarkdownTree(kubelet, outDir)
 	case "kubeadm":
 		// resets global flags created by kubelet or other commands e.g.
