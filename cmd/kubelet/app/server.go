@@ -65,7 +65,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	utilversion "k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apimachinery/pkg/util/wait"
-	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/server/flagz"
 	"k8s.io/apiserver/pkg/server/healthz"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -283,7 +282,6 @@ is checked every 20 seconds (also configurable with a flag).`,
 			if err := checkPermissions(ctx); err != nil {
 				logger.Error(err, "Kubelet running with insufficient permissions")
 			}
-
 			// make the kubelet's config safe for logging
 			config := kubeletServer.KubeletConfiguration.DeepCopy()
 			for k := range config.StaticPodURLHeader {
@@ -299,9 +297,6 @@ is checked every 20 seconds (also configurable with a flag).`,
 
 			// log the kubelet's config for inspection
 			logger.V(5).Info("KubeletConfiguration", "configuration", klog.Format(config))
-
-			// set up signal context for kubelet shutdown
-			ctx := genericapiserver.SetupSignalContext()
 
 			utilfeature.DefaultMutableFeatureGate.AddMetrics()
 			// run the kubelet
@@ -532,7 +527,8 @@ func UnsecuredDependencies(ctx context.Context, s *options.KubeletServer, featur
 		OSInterface:         kubecontainer.RealOS{},
 		VolumePlugins:       plugins,
 		DynamicPluginProber: GetDynamicPluginProber(ctx, s.VolumePluginDir, pluginRunner),
-		TLSOptions:          tlsOptions}, nil
+		TLSOptions:          tlsOptions,
+	}, nil
 }
 
 // Run runs the specified KubeletServer with the given Dependencies. This should never exit.
@@ -912,7 +908,6 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
 			kubeDeps.Recorder,
 			kubeDeps.KubeClient,
 		)
-
 		if err != nil {
 			return err
 		}
@@ -1309,7 +1304,8 @@ func createAndInitKubelet(
 	kubeDeps *kubelet.Dependencies,
 	hostname string,
 	nodeName types.NodeName,
-	nodeIPs []net.IP) (k kubelet.Bootstrap, err error) {
+	nodeIPs []net.IP,
+) (k kubelet.Bootstrap, err error) {
 	// TODO: block until all sources have delivered at least one update to the channel, or break the sync loop
 	// up into "per source" synchronizations
 
