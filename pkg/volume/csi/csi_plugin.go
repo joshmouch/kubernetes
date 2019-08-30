@@ -322,7 +322,7 @@ func (p *csiPlugin) Init(host volume.VolumeHost) error {
 		}
 	}
 
-	var migratedPlugins = map[string](func() bool){
+	migratedPlugins := map[string](func() bool){
 		csitranslationplugins.GCEPDInTreePluginName: func() bool {
 			return true
 		},
@@ -347,18 +347,22 @@ func (p *csiPlugin) Init(host volume.VolumeHost) error {
 	}
 
 	// Initializing the label management channels
-	nim = nodeinfomanager.NewNodeInfoManager(host.GetNodeName(), host, migratedPlugins)
+	localNim := nodeinfomanager.NewNodeInfoManager(host.GetNodeName(), host, migratedPlugins)
 	PluginHandler.csiPlugin = p
 
 	// This function prevents Kubelet from posting Ready status until CSINode
 	// is both installed and initialized
-	if err := initializeCSINode(host, p.csiDriverInformer); err != nil {
+	if err := initializeCSINode(host, localNim, p.csiDriverInformer); err != nil {
 		return errors.New(log("failed to initialize CSINode: %v", err))
+	}
+
+	if _, ok := host.(volume.KubeletVolumeHost); ok {
+		nim = localNim
 	}
 	return nil
 }
 
-func initializeCSINode(host volume.VolumeHost, csiDriverInformer cache.SharedIndexInformer) error {
+func initializeCSINode(host volume.VolumeHost, nim nodeinfomanager.Interfacem, csiDriverInformer cache.SharedIndexInformer) error {
 	kvh, ok := host.(volume.KubeletVolumeHost)
 	if !ok {
 		klog.V(4).Info("Cast from VolumeHost to KubeletVolumeHost failed. Skipping CSINode initialization, not running on kubelet")
@@ -473,8 +477,8 @@ func (p *csiPlugin) RequiresRemount(spec *volume.Spec) bool {
 
 func (p *csiPlugin) NewMounter(
 	spec *volume.Spec,
-	pod *api.Pod) (volume.Mounter, error) {
-
+	pod *api.Pod,
+) (volume.Mounter, error) {
 	volSrc, pvSrc, err := getSourceFromSpec(spec)
 	if err != nil {
 		return nil, err
