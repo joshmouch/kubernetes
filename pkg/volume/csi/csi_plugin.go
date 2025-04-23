@@ -362,7 +362,7 @@ func (p *csiPlugin) Init(host volume.VolumeHost) error {
 	return nil
 }
 
-func initializeCSINode(host volume.VolumeHost, nim nodeinfomanager.Interfacem, csiDriverInformer cache.SharedIndexInformer) error {
+func initializeCSINode(host volume.VolumeHost, nim nodeinfomanager.Interface, csiDriverInformer cache.SharedIndexInformer) error {
 	kvh, ok := host.(volume.KubeletVolumeHost)
 	if !ok {
 		klog.V(4).Info("Cast from VolumeHost to KubeletVolumeHost failed. Skipping CSINode initialization, not running on kubelet")
