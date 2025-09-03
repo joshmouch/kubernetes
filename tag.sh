@@ -34,13 +34,6 @@ for i in $versionFiles; do
 cat > $i << EOF
 package version
 
-const (
-	// DefaultKubeBinaryVersion is the hard coded k8 binary version based on the latest K8s release.
-	// It is supposed to be consistent with gitMajor and gitMinor, except for local tests, where gitMajor and gitMinor are "".
-	// Should update for each minor release!
-	DefaultKubeBinaryVersion = "1.31"
-)
-
 var (
 	gitMajor = "1"
 	gitMinor = "$(echo $1 | cut -f2 -d.)"
@@ -48,6 +41,13 @@ var (
 	gitCommit    = "$(git rev-parse HEAD)"
 	gitTreeState = "clean"
 	buildDate = "$buildDate"
+)
+
+const (
+	// DefaultKubeBinaryVersion is the hard coded k8 binary version based on the latest K8s release.
+	// It is supposed to be consistent with gitMajor and gitMinor, except for local tests, where gitMajor and gitMinor are "".
+	// Should update for each minor release!
+	DefaultKubeBinaryVersion = "$(echo "$1" | cut -d'.' -f1,2 | cut -d'v' -f2)"
 )
 EOF
 done
