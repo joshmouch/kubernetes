@@ -56,6 +56,7 @@ type server struct {
 	rhandler   RegistrationHandler
 	chandler   ClientHandler
 	clients    map[string]Client
+	stopped    bool
 
 	// lastError records the last runtime error. A server is considered healthy till an actual error occurs.
 	lastError error
@@ -84,6 +85,9 @@ func NewServer(logger klog.Logger, socketPath string, rh RegistrationHandler, ch
 }
 
 func (s *server) Start(logger klog.Logger) error {
+	s.mutex.Lock()
+	s.stopped = false
+	s.mutex.Unlock()
 	logger.V(2).Info("Starting device plugin registration server")
 
 	if err := os.MkdirAll(s.socketDir, 0750); err != nil {
@@ -128,27 +132,27 @@ func (s *server) Start(logger klog.Logger) error {
 }
 
 func (s *server) Stop(logger klog.Logger) error {
-	s.visitClients(func(r string, c Client) {
-		if err := s.disconnectClient(logger, r, c); err != nil {
-			logger.Error(err, "Failed to disconnect device plugin client", "resourceName", r)
-		}
-	})
-
+	// Detach pending and connected clients atomically. Registrations that race
+	// with Stop are rejected, and pending handshakes cannot publish afterward.
 	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if s.grpc == nil {
-		return nil
-	}
-
-	s.grpc.Stop()
-	s.wg.Wait()
+	s.stopped = true
+	clients := s.clients
+	s.clients = make(map[string]Client)
+	grpcServer := s.grpc
 	s.grpc = nil
-	// During kubelet termination, we do not need the registration server,
-	// and we consider the kubelet to be healthy even when it is down.
+	s.mutex.Unlock()
+	for resourceName, c := range clients {
+		if err := c.Disconnect(logger); err != nil {
+			logger.Error(err, "Failed to disconnect device plugin client", "resourceName", resourceName)
+		}
+	}
+	if grpcServer != nil {
+		grpcServer.Stop()
+		s.wg.Wait()
+	}
+	// During kubelet termination, a stopped registration server is healthy.
 	s.setHealthy()
 	logger.V(2).Info("Stopping device plugin registration server")
-
 	return nil
 }
 
@@ -194,16 +198,6 @@ func (s *server) isVersionCompatibleWithPlugin(versions ...string) bool {
 		}
 	}
 	return false
-}
-
-func (s *server) visitClients(visit func(r string, c Client)) {
-	s.mutex.Lock()
-	for r, c := range s.clients {
-		s.mutex.Unlock()
-		visit(r, c)
-		s.mutex.Lock()
-	}
-	s.mutex.Unlock()
 }
 
 func (s *server) Name() string {

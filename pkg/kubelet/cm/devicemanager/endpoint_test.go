@@ -59,15 +59,15 @@ func (m *mockPluginManager) CleanupPluginDirectory(r string) error {
 	return m.cleanupPluginDirectory(r)
 }
 
-func (m *mockPluginManager) PluginConnected(_ context.Context, r string, p plugin.DevicePlugin) error {
+func (m *mockPluginManager) PluginConnected(_ context.Context, r string, p plugin.DevicePlugin, _ *pluginapi.DevicePluginOptions) error {
 	return m.pluginConnected(r, p)
 }
 
-func (m *mockPluginManager) PluginDisconnected(logger klog.Logger, r string) {
+func (m *mockPluginManager) PluginDisconnected(logger klog.Logger, r string, _ plugin.DevicePlugin) {
 	m.pluginDisconnected(logger, r)
 }
 
-func (m *mockPluginManager) PluginListAndWatchReceiver(_ klog.Logger, r string, lr *pluginapi.ListAndWatchResponse) {
+func (m *mockPluginManager) PluginListAndWatchReceiver(_ klog.Logger, r string, _ plugin.DevicePlugin, lr *pluginapi.ListAndWatchResponse) {
 	m.pluginListAndWatchReceiver(r, lr)
 }
 

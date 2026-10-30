@@ -661,6 +661,11 @@ func (p *podWorkers) CouldHaveRunningContainers(uid types.UID) bool {
 	if status, ok := p.podSyncStatuses[uid]; ok {
 		return !status.IsTerminated()
 	}
+	// Waiting for native device inventory does not transfer runtime/content
+	// ownership to cleanup, even though no admitted worker exists yet.
+	if p.allocationManager != nil && p.allocationManager.IsPodAdmissionPending(uid) {
+		return true
+	}
 	// once all pods are synced, any pod without sync status is known to not be running.
 	return !p.podsSynced
 }
@@ -670,6 +675,11 @@ func (p *podWorkers) ShouldPodBeFinished(uid types.UID) bool {
 	defer p.podLock.Unlock()
 	if status, ok := p.podSyncStatuses[uid]; ok {
 		return status.IsFinished()
+	}
+	// Waiting for native device inventory does not transfer runtime/content
+	// ownership to cleanup, even though no admitted worker exists yet.
+	if p.allocationManager != nil && p.allocationManager.IsPodAdmissionPending(uid) {
+		return false
 	}
 	// once all pods are synced, any pod without sync status is assumed to
 	// have SyncTerminatedPod finished.
@@ -696,6 +706,11 @@ func (p *podWorkers) ShouldPodContainersBeTerminating(uid types.UID) bool {
 		// be executed again, which means no new containers can be started
 		return status.IsTerminationStarted()
 	}
+	// Waiting for native device inventory does not transfer runtime/content
+	// ownership to cleanup, even though no admitted worker exists yet.
+	if p.allocationManager != nil && p.allocationManager.IsPodAdmissionPending(uid) {
+		return false
+	}
 	// once we've synced, if the pod isn't known to the workers we should be tearing them
 	// down
 	return p.podsSynced
@@ -707,6 +722,11 @@ func (p *podWorkers) ShouldPodRuntimeBeRemoved(uid types.UID) bool {
 	if status, ok := p.podSyncStatuses[uid]; ok {
 		return status.IsTerminated()
 	}
+	// Waiting for native device inventory does not transfer runtime/content
+	// ownership to cleanup, even though no admitted worker exists yet.
+	if p.allocationManager != nil && p.allocationManager.IsPodAdmissionPending(uid) {
+		return false
+	}
 	// a pod that hasn't been sent to the pod worker yet should have no runtime components once we have
 	// synced all content.
 	return p.podsSynced
@@ -717,6 +737,11 @@ func (p *podWorkers) ShouldPodContentBeRemoved(uid types.UID) bool {
 	defer p.podLock.Unlock()
 	if status, ok := p.podSyncStatuses[uid]; ok {
 		return status.IsEvicted() || (status.IsDeleted() && status.IsTerminated())
+	}
+	// Waiting for native device inventory does not transfer runtime/content
+	// ownership to cleanup, even though no admitted worker exists yet.
+	if p.allocationManager != nil && p.allocationManager.IsPodAdmissionPending(uid) {
+		return false
 	}
 	// a pod that hasn't been sent to the pod worker yet should have no content on disk once we have
 	// synced all content.

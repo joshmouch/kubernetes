@@ -47,6 +47,7 @@ import (
 	watcherapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
+	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
 	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 	"k8s.io/kubernetes/pkg/kubelet/cm/devicemanager/checkpoint"
 	plugin "k8s.io/kubernetes/pkg/kubelet/cm/devicemanager/plugin/v1beta1"
@@ -80,7 +81,7 @@ type wrappedManagerImpl struct {
 	callback  func(klog.Logger, string, []*pluginapi.Device)
 }
 
-func (m *wrappedManagerImpl) PluginListAndWatchReceiver(logger klog.Logger, r string, resp *pluginapi.ListAndWatchResponse) {
+func (m *wrappedManagerImpl) PluginListAndWatchReceiver(logger klog.Logger, r string, _ plugin.DevicePlugin, resp *pluginapi.ListAndWatchResponse) {
 	m.callback(logger, r, resp.Devices)
 }
 
@@ -434,7 +435,7 @@ func TestUpdateCapacityAllocatable(t *testing.T) {
 	resourceName2 := "resource2"
 	e2 := &endpointImpl{}
 	e2.client = plugin.NewPluginClient(resourceName2, socketName, testManager)
-	testManager.endpoints[resourceName2] = endpointInfo{e: e2, opts: nil}
+	testManager.endpoints[resourceName2] = endpointInfo{e: e2, opts: nil, plugin: e2.client}
 	callback(logger, resourceName2, devs)
 	capacity, allocatable, removedResources = testManager.GetCapacity()
 	as.Len(capacity, 2)
@@ -485,7 +486,7 @@ func TestUpdateCapacityAllocatable(t *testing.T) {
 	// for resourceName2, its capacity is set to zero, and we still consider
 	// it as a DevicePlugin resource. This makes sure any pod that was scheduled
 	// during the time of propagating capacity change to the scheduler will be
-	// properly rejected instead of being incorrectly started.
+	// deferred until the plugin reports inventory instead of incorrectly started.
 	err = testManager.writeCheckpoint(logger)
 	as.NoError(err)
 	testManager.healthyDevices = make(map[string]sets.Set[string])
@@ -1189,7 +1190,7 @@ func TestPodContainerDeviceToAllocate(t *testing.T) {
 			required:                 1,
 			reusableDevices:          sets.New[string](),
 			expectedAllocatedDevices: nil,
-			expErr:                   fmt.Errorf("cannot allocate unregistered device %s", resourceName2),
+			expErr:                   admission.NewDeviceNotReadyError(fmt.Errorf("cannot allocate unregistered device %s", resourceName2)),
 		},
 		{
 			description:              "Admission error in case resource not devices previously allocated no longer healthy",
@@ -2162,7 +2163,7 @@ func TestEndpointSyncOnDisconnect(t *testing.T) {
 		stopTime:     time.Now().Add(-endpointStopGracePeriod * 2), // make the grace period expired
 	}
 
-	manager.endpoints[resourceName] = endpointInfo{e: ep, opts: nil}
+	manager.endpoints[resourceName] = endpointInfo{e: ep, opts: nil, plugin: ep.client}
 	devs := []*pluginapi.Device{
 		{ID: "Device1", Health: pluginapi.Healthy},
 		{ID: "Device2", Health: pluginapi.Healthy},
@@ -2190,4 +2191,93 @@ func TestEndpointSyncOnDisconnect(t *testing.T) {
 	require.Empty(t, manager.endpoints)
 	require.Empty(t, manager.healthyDevices)
 	require.Empty(t, manager.unhealthyDevices)
+}
+
+// TestDeviceInventoryAdmissionLifecycle keeps the checkpoint allocation and Pod
+// UID while connection and inventory arrive independently during kubelet restart.
+func TestDeviceInventoryAdmissionLifecycle(t *testing.T) {
+	logger, ctx := ktesting.NewTestContext(t)
+	resourceName := "example.com/restart-device"
+	dir := t.TempDir()
+	m, err := newManagerImpl(logger, filepath.Join(dir, "kubelet.sock"), nil, topologymanager.NewFakeManager())
+	require.NoError(t, err)
+	m.sourcesReady = &sourcesReadyStub{}
+	m.activePods = func() []*v1.Pod { return nil }
+	m.podDevices.insert("original-pod", "container", resourceName,
+		checkpoint.DevicesPerNUMA{nodeWithoutTopology: []string{"device1"}}, newContainerAllocateResponse())
+	m.healthyDevices[resourceName] = sets.New("device1")
+	require.NoError(t, m.writeCheckpoint(logger))
+	m.podDevices = newPodDevices()
+	m.healthyDevices = make(map[string]sets.Set[string])
+	m.unhealthyDevices = make(map[string]sets.Set[string])
+	require.NoError(t, m.readCheckpoint(logger))
+	require.Nil(t, m.healthyDevices[resourceName])
+	allocatedBefore := m.podDevices.devices()
+	checkDeferred := func() {
+		t.Helper()
+		_, err := m.devicesToAllocate(ctx, "original-pod", "container", resourceName, 1, sets.New[string]())
+		require.Error(t, err)
+		require.True(t, admission.GetPodAdmitResult(err).Defer)
+		require.Equal(t, allocatedBefore, m.podDevices.devices())
+		require.Equal(t, allocatedBefore, m.allocatedDevices)
+	}
+	checkDeferred()
+	stub := plugin.NewDevicePluginStub(logger, nil, filepath.Join(dir, "plugin.sock"), resourceName, false, false)
+	require.NoError(t, stub.Start(ctx))
+	t.Cleanup(func() { require.NoError(t, stub.Stop(logger)) })
+	connect := func() plugin.Client {
+		t.Helper()
+		c := plugin.NewPluginClient(resourceName, filepath.Join(dir, "plugin.sock"), m)
+		require.NoError(t, c.Connect(ctx))
+		t.Cleanup(func() { require.NoError(t, c.Disconnect(logger)) })
+		return c
+	}
+	first := connect()
+	checkDeferred() // Connected is not the first inventory report.
+	report := &pluginapi.ListAndWatchResponse{Devices: []*pluginapi.Device{{ID: "device1", Health: pluginapi.Healthy}}}
+	m.PluginListAndWatchReceiver(logger, resourceName, first, report)
+	needed, err := m.devicesToAllocate(ctx, "original-pod", "container", resourceName, 1, sets.New[string]())
+	require.NoError(t, err)
+	require.Empty(t, needed) // Restored allocation is reused, never reallocated.
+	require.Equal(t, allocatedBefore, m.podDevices.devices())
+	require.NoError(t, first.Disconnect(logger))
+	checkDeferred()
+	second := connect()
+	checkDeferred()
+	// An old stream or disconnect cannot establish readiness or stop its successor.
+	m.PluginListAndWatchReceiver(logger, resourceName, first, report)
+	m.PluginDisconnected(logger, resourceName, first)
+	checkDeferred()
+	require.False(t, m.endpoints[resourceName].e.isStopped())
+	m.PluginListAndWatchReceiver(logger, resourceName, second, report)
+	_, err = m.devicesToAllocate(ctx, "original-pod", "container", resourceName, 1, sets.New[string]())
+	require.NoError(t, err)
+}
+
+func TestDeviceInventoryExplicitUnhealthyIsNotDeferred(t *testing.T) {
+	for _, devices := range [][]*pluginapi.Device{
+		{},
+		{{ID: "device1", Health: pluginapi.Unhealthy}},
+	} {
+		t.Run(fmt.Sprintf("reported-devices-%d", len(devices)), func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			dir := t.TempDir()
+			m, err := newManagerImpl(logger, filepath.Join(dir, "kubelet.sock"), nil, topologymanager.NewFakeManager())
+			require.NoError(t, err)
+			resourceName := "example.com/reported-device"
+			stub := plugin.NewDevicePluginStub(logger, nil, filepath.Join(dir, "plugin.sock"), resourceName, false, false)
+			require.NoError(t, stub.Start(ctx))
+			t.Cleanup(func() { require.NoError(t, stub.Stop(logger)) })
+			c := plugin.NewPluginClient(resourceName, filepath.Join(dir, "plugin.sock"), m)
+			require.NoError(t, c.Connect(ctx))
+			t.Cleanup(func() { require.NoError(t, c.Disconnect(logger)) })
+			_, err = m.devicesToAllocate(ctx, "new-pod", "container", resourceName, 1, sets.New[string]())
+			require.True(t, admission.GetPodAdmitResult(err).Defer)
+			m.PluginListAndWatchReceiver(logger, resourceName, c, &pluginapi.ListAndWatchResponse{Devices: devices})
+			require.NotNil(t, m.healthyDevices[resourceName])
+			_, err = m.devicesToAllocate(ctx, "new-pod", "container", resourceName, 1, sets.New[string]())
+			require.ErrorContains(t, err, "no healthy devices present")
+			require.False(t, admission.GetPodAdmitResult(err).Defer)
+		})
+	}
 }

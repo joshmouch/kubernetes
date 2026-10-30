@@ -747,7 +747,13 @@ func (jm *ControllerV2) removeOldestJobs(ctx context.Context, cj *batchv1.CronJo
 // deleteJob reaps a job, deleting the job, the pods and the reference in the active list
 func deleteJob(logger klog.Logger, cj *batchv1.CronJob, job *batchv1.Job, jc jobControlInterface, recorder record.EventRecorder) bool {
 	// delete the job itself...
-	if err := jc.DeleteJob(job.Namespace, job.Name); err != nil {
+	if err := jc.DeleteJob(job.Namespace, job.Name, job.UID); err != nil {
+		if errors.IsNotFound(err) {
+			// A cached Job can outlive its API object. Settle only that UID;
+			// absence is not a new deletion effect.
+			deleteFromActiveList(cj, job.UID)
+			return true
+		}
 		recorder.Eventf(cj, corev1.EventTypeWarning, "FailedDelete", "Deleted job: %v", err)
 		logger.Error(err, "Error deleting job from cronjob", "job", klog.KObj(job), "cronjob", klog.KObj(cj))
 		return false

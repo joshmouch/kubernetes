@@ -1203,6 +1203,7 @@ func (kl *Kubelet) removeOrphanedPodStatuses(logger klog.Logger, pods []*v1.Pod,
 // are updated with a fixed UID (most should use a dynamic UID), and no config
 // updates are delivered to the pod workers while this method is running.
 func (kl *Kubelet) HandlePodCleanups(ctx context.Context) error {
+	kl.retryDeferredAdmissions(ctx)
 	logger := klog.FromContext(ctx)
 	// The kubelet lacks checkpointing, so we need to introspect the set of pods
 	// in the cgroup tree prior to inspecting the set of pods in our pod manager.
@@ -1267,6 +1268,16 @@ func (kl *Kubelet) HandlePodCleanups(ctx context.Context) error {
 		case TerminatingPod:
 			possiblyRunningPods[uid] = struct{}{}
 		default:
+		}
+	}
+
+	// Deferred desired pods can still have runtime containers after kubelet restart.
+	// Protect their native resources without inventing a pod worker or admission.
+	deferredPods := sets.New[types.UID]()
+	for _, pod := range allPods {
+		if pod.DeletionTimestamp == nil && !podutil.IsPodPhaseTerminal(pod.Status.Phase) && kl.allocationManager.IsPodAdmissionPending(pod.UID) {
+			deferredPods.Insert(pod.UID)
+			possiblyRunningPods[pod.UID] = struct{}{}
 		}
 	}
 
@@ -1353,6 +1364,16 @@ func (kl *Kubelet) HandlePodCleanups(ctx context.Context) error {
 			continue
 		}
 
+		// A pod whose admission has been deferred (e.g. it requests a device
+		// plugin resource that is not yet registered) is intentionally not known
+		// to the pod workers: HandlePodAdditions kept it Pending without
+		// dispatching it. Such a pod is not admitted, so it must not be started
+		// here. The allocation manager retries its admission and will dispatch it
+		// once it is admitted, or reject it if the deferral times out.
+		if kl.allocationManager.IsPodAdmissionPending(desiredPod.UID) {
+			continue
+		}
+
 		logger.V(3).Info("Pod will be restarted because it is in the desired set and not known to the pod workers (likely due to UID reuse)", "podUID", desiredPod.UID)
 		isStatic := kubetypes.IsStaticPod(desiredPod)
 		pod, mirrorPod, wasMirror := kl.podManager.GetPodAndMirrorPod(desiredPod)
@@ -1406,7 +1427,7 @@ func (kl *Kubelet) HandlePodCleanups(ctx context.Context) error {
 		// been added to the pod worker in the meantime. Note that pods that are not visible in the runtime
 		// but which were previously known are terminated by SyncKnownPods().
 		_, knownPod := workingPods[runningPod.ID]
-		if !knownPod {
+		if !knownPod && !deferredPods.Has(runningPod.ID) {
 			one := int64(1)
 			killPodOptions := &KillPodOptions{
 				PodTerminationGracePeriodSecondsOverride: &one,

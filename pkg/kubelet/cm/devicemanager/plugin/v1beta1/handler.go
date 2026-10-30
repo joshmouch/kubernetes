@@ -46,6 +46,11 @@ func (s *server) RegisterPlugin(pluginName string, endpoint string, versions []s
 	// Use context.TODO() because we currently do not have a proper context to pass in.
 	// Replace this with an appropriate context when refactoring this function to accept a context parameter.
 	ctx := context.TODO()
+	if pluginClientTimeout != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *pluginClientTimeout)
+		defer cancel()
+	}
 	logger := klog.FromContext(ctx)
 	logger.V(2).Info("Registering plugin at endpoint", "plugin", pluginName, "endpoint", endpoint)
 	return s.connectClient(ctx, pluginName, endpoint)
@@ -55,7 +60,7 @@ func (s *server) DeRegisterPlugin(pluginName, endpoint string) {
 	logger := klog.FromContext(context.TODO())
 	logger.V(2).Info("Deregistering plugin", "plugin", pluginName, "endpoint", endpoint)
 	client := s.getClient(pluginName)
-	if client != nil {
+	if client != nil && client.SocketPath() == endpoint {
 		if err := s.disconnectClient(logger, pluginName, client); err != nil {
 			logger.Error(err, "disconnecting client", "plugin", pluginName, "endpoing", endpoint)
 		}
@@ -84,9 +89,13 @@ func (s *server) connectClient(ctx context.Context, name string, socketPath stri
 	logger := klog.FromContext(ctx)
 	c := NewPluginClient(name, socketPath, s.chandler)
 
-	s.registerClient(logger, name, c)
+	if err := s.registerClient(logger, name, c); err != nil {
+		return err
+	}
 	if err := c.Connect(ctx); err != nil {
-		s.deregisterClient(logger, name)
+		if disconnectErr := s.disconnectClient(logger, name, c); disconnectErr != nil {
+			logger.Error(disconnectErr, "Unable to close failed client", "resource", name)
+		}
 		logger.Error(err, "Failed to connect to new client", "resource", name)
 		return err
 	}
@@ -100,33 +109,35 @@ func (s *server) connectClient(ctx context.Context, name string, socketPath stri
 }
 
 func (s *server) disconnectClient(logger klog.Logger, name string, c Client) error {
-	s.deregisterClient(logger, name)
+	s.mutex.Lock()
+	if s.clients[name] == c {
+		delete(s.clients, name)
+	}
+	s.mutex.Unlock()
 	return c.Disconnect(logger)
 }
-func (s *server) registerClient(logger klog.Logger, name string, c Client) {
+func (s *server) registerClient(logger klog.Logger, name string, c Client) error {
 	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
+	if s.stopped {
+		s.mutex.Unlock()
+		c.Disconnect(logger)
+		return fmt.Errorf("device plugin registration server is stopped")
+	}
+	previous := s.clients[name]
 	s.clients[name] = c
+	s.mutex.Unlock()
+	if previous != nil && previous != c {
+		if err := previous.Disconnect(logger); err != nil {
+			logger.Error(err, "Unable to close replaced client", "resource", name)
+		}
+	}
 	logger.V(2).Info("Registered client", "name", name)
-}
-
-func (s *server) deregisterClient(logger klog.Logger, name string) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	delete(s.clients, name)
-	logger.V(2).Info("Deregistered client", "name", name)
+	return nil
 }
 
 func (s *server) runClient(ctx context.Context, name string, c Client) {
 	logger := klog.FromContext(ctx)
 	c.Run(ctx)
-
-	c = s.getClient(name)
-	if c == nil {
-		return
-	}
 
 	if err := s.disconnectClient(logger, name, c); err != nil {
 		logger.Error(err, "Unable to disconnect client", "resource", name, "client", c)

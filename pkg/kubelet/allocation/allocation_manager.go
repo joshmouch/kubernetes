@@ -85,18 +85,26 @@ type Manager interface {
 	SetContainerRuntime(runtime kubecontainer.Runtime)
 
 	// AddPod checks if a pod can be admitted. If so, it admits the pod and updates the allocation.
-	// The function returns a boolean value indicating whether the pod
-	// can be admitted, a brief single-word reason and a message explaining why
-	// the pod cannot be admitted.
+	// The lifecycle result distinguishes admission, transient inventory deferral,
+	// and permanent rejection without losing the handler reason or message.
 	// allocatedPods should represent the pods that have already been admitted, along with their
 	// admitted (allocated) resources.
-	AddPod(activePods []*v1.Pod, pod *v1.Pod) (ok bool, reason, message string)
+	AddPod(activePods []*v1.Pod, pod *v1.Pod) lifecycle.PodAdmitResult
 
 	// RemovePod removes any stored state for the given pod UID.
 	RemovePod(uid types.UID)
 
 	// RemoveOrphanedPods removes the stored state for any pods not included in the set of remaining pods.
 	RemoveOrphanedPods(remainingPods sets.Set[types.UID])
+
+	// BeginPodAdmission owns the UID before desired-state publication.
+	BeginPodAdmission(uid types.UID)
+	IsPodAdmissionPending(uid types.UID) bool
+	// MarkPodAdmissionDeferred retains the original kubelet-clock timestamp.
+	MarkPodAdmissionDeferred(uid types.UID, now time.Time)
+	ClearPodAdmission(uid types.UID)
+	IsPodAdmissionDeferred(uid types.UID) bool
+	SnapshotDeferredAdmissions() map[types.UID]time.Time
 
 	// Run starts the allocation manager. This is currently only used to handle periodic retry of
 	// pending resizes.
@@ -127,6 +135,12 @@ type manager struct {
 
 	allocationMutex        sync.Mutex
 	podsWithPendingResizes []types.UID
+
+	// deferredAdmissionLock guards podsWithPendingAdmission.
+	deferredAdmissionLock sync.Mutex
+	// A nil value means evaluating admission; a nonnil timestamp is the first
+	// actual device deferral. Both retain UID ownership without an admitted worker.
+	podsWithPendingAdmission map[types.UID]*time.Time
 
 	recorder record.EventRecorderLogger
 }
@@ -518,7 +532,7 @@ func (m *manager) SetContainerRuntime(runtime kubecontainer.Runtime) {
 	m.containerRuntime = runtime
 }
 
-func (m *manager) AddPod(activePods []*v1.Pod, pod *v1.Pod) (bool, string, string) {
+func (m *manager) AddPod(activePods []*v1.Pod, pod *v1.Pod) lifecycle.PodAdmitResult {
 	// Use klog.TODO() because we currently do not have a proper logger to pass in.
 	// Replace this with an appropriate logger when refactoring this function to accept a logger parameter.
 	logger := klog.TODO()
@@ -533,9 +547,9 @@ func (m *manager) AddPod(activePods []*v1.Pod, pod *v1.Pod) (bool, string, strin
 
 	// Check if we can admit the pod; if so, update the allocation.
 	allocatedPods := m.getAllocatedPods(activePods)
-	ok, reason, message := m.canAdmitPod(logger, allocatedPods, pod, lifecycle.AddOperation)
+	result := m.canAdmitPod(logger, allocatedPods, pod, lifecycle.AddOperation)
 
-	if ok && utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+	if result.Admit && utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
 		// Checkpoint the resource values at which the Pod has been admitted or resized.
 		if err := m.SetAllocatedResources(pod); err != nil {
 			// TODO(vinaykul,InPlacePodVerticalScaling): Can we recover from this in some way? Investigate
@@ -543,10 +557,11 @@ func (m *manager) AddPod(activePods []*v1.Pod, pod *v1.Pod) (bool, string, strin
 		}
 	}
 
-	return ok, reason, message
+	return result
 }
 
 func (m *manager) RemovePod(uid types.UID) {
+	m.ClearPodAdmission(uid)
 	// Use klog.TODO() because we currently do not have a proper logger to pass in.
 	// Replace this with an appropriate logger when refactoring this function to accept a logger parameter.
 	logger := klog.TODO()
@@ -558,6 +573,71 @@ func (m *manager) RemovePod(uid types.UID) {
 
 func (m *manager) RemoveOrphanedPods(remainingPods sets.Set[types.UID]) {
 	m.allocated.RemoveOrphanedPods(remainingPods)
+	m.deferredAdmissionLock.Lock()
+	defer m.deferredAdmissionLock.Unlock()
+	for uid := range m.podsWithPendingAdmission {
+		if !remainingPods.Has(uid) {
+			delete(m.podsWithPendingAdmission, uid)
+		}
+	}
+}
+
+func (m *manager) BeginPodAdmission(uid types.UID) {
+	m.deferredAdmissionLock.Lock()
+	defer m.deferredAdmissionLock.Unlock()
+	if m.podsWithPendingAdmission == nil {
+		m.podsWithPendingAdmission = make(map[types.UID]*time.Time)
+	}
+	if _, exists := m.podsWithPendingAdmission[uid]; !exists {
+		m.podsWithPendingAdmission[uid] = nil
+	}
+}
+
+func (m *manager) IsPodAdmissionPending(uid types.UID) bool {
+	m.deferredAdmissionLock.Lock()
+	defer m.deferredAdmissionLock.Unlock()
+	_, pending := m.podsWithPendingAdmission[uid]
+	return pending
+}
+
+func (m *manager) MarkPodAdmissionDeferred(uid types.UID, now time.Time) {
+	m.deferredAdmissionLock.Lock()
+	defer m.deferredAdmissionLock.Unlock()
+	if m.podsWithPendingAdmission == nil {
+		m.podsWithPendingAdmission = make(map[types.UID]*time.Time)
+	}
+	if m.podsWithPendingAdmission[uid] == nil {
+		firstDeferred := now
+		m.podsWithPendingAdmission[uid] = &firstDeferred
+	}
+}
+
+func (m *manager) ClearPodAdmission(uid types.UID) {
+	m.deferredAdmissionLock.Lock()
+	defer m.deferredAdmissionLock.Unlock()
+	delete(m.podsWithPendingAdmission, uid)
+}
+
+func (m *manager) IsPodAdmissionDeferred(uid types.UID) bool {
+	m.deferredAdmissionLock.Lock()
+	defer m.deferredAdmissionLock.Unlock()
+	firstDeferred, pending := m.podsWithPendingAdmission[uid]
+	return pending && firstDeferred != nil
+}
+
+func (m *manager) SnapshotDeferredAdmissions() map[types.UID]time.Time {
+	m.deferredAdmissionLock.Lock()
+	defer m.deferredAdmissionLock.Unlock()
+	if len(m.podsWithPendingAdmission) == 0 {
+		return nil
+	}
+	snapshot := make(map[types.UID]time.Time, len(m.podsWithPendingAdmission))
+	for uid, firstDeferred := range m.podsWithPendingAdmission {
+		if firstDeferred != nil {
+			snapshot[uid] = *firstDeferred
+		}
+	}
+	return snapshot
 }
 
 func (m *manager) handlePodResourcesResize(logger klog.Logger, pod *v1.Pod) (bool, error) {
@@ -569,8 +649,8 @@ func (m *manager) handlePodResourcesResize(logger klog.Logger, pod *v1.Pod) (boo
 	}
 
 	// Desired resources != allocated resources. Can we update the allocation to the desired resources?
-	fit, reason, message := m.canAdmitPod(logger, m.getAllocatedPods(m.getActivePods()), pod, lifecycle.ResizeOperation)
-	if fit {
+	result := m.canAdmitPod(logger, m.getAllocatedPods(m.getActivePods()), pod, lifecycle.ResizeOperation)
+	if result.Admit {
 		// Update pod resource allocation checkpoint
 		if err := m.SetAllocatedResources(pod); err != nil {
 			return false, err
@@ -587,6 +667,7 @@ func (m *manager) handlePodResourcesResize(logger klog.Logger, pod *v1.Pod) (boo
 		return true, nil
 	}
 
+	reason, message := result.Reason, result.Message
 	if reason != "" {
 		if m.statusManager.SetPodResizePendingCondition(pod.UID, reason, message, pod.Generation) {
 			eventType := events.ResizeDeferred
@@ -608,7 +689,7 @@ func (m *manager) handlePodResourcesResize(logger klog.Logger, pod *v1.Pod) (boo
 // the pod cannot be admitted.
 // allocatedPods should represent the pods that have already been admitted, along with their
 // admitted (allocated) resources.
-func (m *manager) canAdmitPod(logger klog.Logger, allocatedPods []*v1.Pod, pod *v1.Pod, operation lifecycle.Operation) (bool, string, string) {
+func (m *manager) canAdmitPod(logger klog.Logger, allocatedPods []*v1.Pod, pod *v1.Pod, operation lifecycle.Operation) lifecycle.PodAdmitResult {
 	// Filter out the pod being evaluated.
 	allocatedPods = slices.DeleteFunc(allocatedPods, func(p *v1.Pod) bool { return p.UID == pod.UID })
 
@@ -617,11 +698,11 @@ func (m *manager) canAdmitPod(logger klog.Logger, allocatedPods []*v1.Pod, pod *
 	for _, podAdmitHandler := range m.admitHandlers {
 		if result := podAdmitHandler.Admit(attrs); !result.Admit {
 			logger.Info("Pod admission denied", "podUID", attrs.Pod.UID, "pod", klog.KObj(attrs.Pod), "reason", result.Reason, "message", result.Message, "operation", operation)
-			return false, result.Reason, result.Message
+			return result
 		}
 	}
 
-	return true, "", ""
+	return lifecycle.PodAdmitResult{Admit: true}
 }
 
 func (m *manager) getAllocatedPods(activePods []*v1.Pod) []*v1.Pod {

@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 )
@@ -83,9 +84,8 @@ type jobControlInterface interface {
 	GetJob(namespace, name string) (*batchv1.Job, error)
 	// CreateJob creates new Jobs according to the spec.
 	CreateJob(namespace string, job *batchv1.Job) (*batchv1.Job, error)
-	// DeleteJob deletes the Job identified by name.
-	// TODO: delete by UID?
-	DeleteJob(namespace string, name string) error
+	// DeleteJob deletes only the Job with the supplied name and UID.
+	DeleteJob(namespace string, name string, uid types.UID) error
 }
 
 // realJobControl is the default implementation of jobControlInterface.
@@ -104,9 +104,9 @@ func (r realJobControl) CreateJob(namespace string, job *batchv1.Job) (*batchv1.
 	return r.KubeClient.BatchV1().Jobs(namespace).Create(context.TODO(), job, metav1.CreateOptions{})
 }
 
-func (r realJobControl) DeleteJob(namespace string, name string) error {
+func (r realJobControl) DeleteJob(namespace string, name string, uid types.UID) error {
 	background := metav1.DeletePropagationBackground
-	return r.KubeClient.BatchV1().Jobs(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{PropagationPolicy: &background})
+	return r.KubeClient.BatchV1().Jobs(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{PropagationPolicy: &background, Preconditions: &metav1.Preconditions{UID: &uid}})
 }
 
 type fakeJobControl struct {
@@ -114,6 +114,7 @@ type fakeJobControl struct {
 	Job           *batchv1.Job
 	Jobs          []batchv1.Job
 	DeleteJobName []string
+	DeleteJobUID  []types.UID
 	Err           error
 	CreateErr     error
 	UpdateJobName []string
@@ -143,9 +144,10 @@ func (f *fakeJobControl) GetJob(namespace, name string) (*batchv1.Job, error) {
 	return f.Job, nil
 }
 
-func (f *fakeJobControl) DeleteJob(namespace string, name string) error {
+func (f *fakeJobControl) DeleteJob(namespace string, name string, uid types.UID) error {
 	f.Lock()
 	defer f.Unlock()
+	f.DeleteJobUID = append(f.DeleteJobUID, uid)
 	if f.Err != nil {
 		return f.Err
 	}

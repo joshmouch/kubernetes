@@ -34,8 +34,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/ktesting"
 	"k8s.io/utils/ptr"
 
@@ -1983,5 +1985,114 @@ func TestControllerV2JobAlreadyExistsButDifferentOwner(t *testing.T) {
 
 	if len(cronJobControl.Updates) != 0 {
 		t.Fatalf("Unexpected updates to cronjob, got: %d, expected 0", len(cronJobControl.Updates))
+	}
+}
+
+func TestDeleteJobCleanupOutcome(t *testing.T) {
+	resource := schema.GroupResource{Group: "batch", Resource: "jobs"}
+	for _, tc := range []struct {
+		name          string
+		err           error
+		wantSettled   bool
+		wantEventType string
+	}{
+		{name: "deleted", wantSettled: true, wantEventType: v1.EventTypeNormal},
+		{name: "already absent", err: errors.NewNotFound(resource, "same-name"), wantSettled: true},
+		{name: "forbidden", err: errors.NewForbidden(resource, "same-name", fmt.Errorf("denied")), wantEventType: v1.EventTypeWarning},
+		{name: "replacement conflict", err: errors.NewConflict(resource, "same-name", fmt.Errorf("UID changed")), wantEventType: v1.EventTypeWarning},
+		{name: "transport failure", err: fmt.Errorf("connection reset"), wantEventType: v1.EventTypeWarning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			cj := cronJob()
+			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: cj.Namespace, Name: "same-name", UID: "original"}}
+			cj.Status.Active = []v1.ObjectReference{
+				{Namespace: cj.Namespace, Name: job.Name, UID: job.UID},
+				{Namespace: cj.Namespace, Name: job.Name, UID: "replacement"},
+				{Namespace: cj.Namespace, Name: "other", UID: "unrelated"},
+			}
+			before := append([]v1.ObjectReference(nil), cj.Status.Active...)
+			jc := &fakeJobControl{Err: tc.err}
+			recorder := record.NewFakeRecorder(2)
+			if got := deleteJob(klog.FromContext(ctx), &cj, job, jc, recorder); got != tc.wantSettled {
+				t.Fatalf("settled=%v, want %v", got, tc.wantSettled)
+			}
+			if !reflect.DeepEqual(jc.DeleteJobUID, []types.UID{job.UID}) {
+				t.Fatalf("delete attempted UIDs=%v, want original UID %s", jc.DeleteJobUID, job.UID)
+			}
+			wantActive := before
+			if tc.wantSettled {
+				wantActive = before[1:]
+			}
+			if !reflect.DeepEqual(cj.Status.Active, wantActive) {
+				t.Fatalf("active references=%v, want %v", cj.Status.Active, wantActive)
+			}
+			select {
+			case event := <-recorder.Events:
+				if tc.wantEventType == "" || !strings.HasPrefix(event, tc.wantEventType+" ") {
+					t.Fatalf("unexpected event %q, want type %q", event, tc.wantEventType)
+				}
+			default:
+				if tc.wantEventType != "" {
+					t.Fatalf("missing event type %s", tc.wantEventType)
+				}
+			}
+			if errors.IsNotFound(tc.err) {
+				if !deleteJob(klog.FromContext(ctx), &cj, job, jc, recorder) || !reflect.DeepEqual(cj.Status.Active, wantActive) {
+					t.Fatalf("repeated cleanup did not preserve settled original UID and unrelated references")
+				}
+				select {
+				case event := <-recorder.Events:
+					t.Fatalf("already absent cleanup claimed an event: %s", event)
+				default:
+				}
+			}
+		})
+	}
+}
+
+func TestRealJobControlDeleteJobUIDPrecondition(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		currentUID types.UID
+	}{
+		{name: "original job", currentUID: "original"},
+		{name: "same name replacement", currentUID: "replacement"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "same-name", UID: tc.currentUID}}
+			client := fake.NewSimpleClientset(job)
+			resource := batchv1.SchemeGroupVersion.WithResource("jobs")
+			// The fake tracker does not enforce UID preconditions. Model the API
+			// check explicitly so a missing fence cannot delete the replacement.
+			client.PrependReactor("delete", "jobs", func(action clienttesting.Action) (bool, runtime.Object, error) {
+				deletion := action.(clienttesting.DeleteAction)
+				options := deletion.GetDeleteOptions()
+				if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != "original" {
+					t.Fatalf("delete did not carry the cached original UID: %#v", options.Preconditions)
+				}
+				if options.PropagationPolicy == nil || *options.PropagationPolicy != metav1.DeletePropagationBackground {
+					t.Fatalf("delete changed background propagation: %#v", options.PropagationPolicy)
+				}
+				obj, err := client.Tracker().Get(resource, action.GetNamespace(), deletion.GetName())
+				if err != nil {
+					return true, nil, err
+				}
+				if obj.(*batchv1.Job).UID != *options.Preconditions.UID {
+					return true, nil, errors.NewConflict(resource.GroupResource(), deletion.GetName(), fmt.Errorf("UID precondition failed"))
+				}
+				return false, nil, nil
+			})
+			jc := realJobControl{KubeClient: client}
+			err := jc.DeleteJob(job.Namespace, job.Name, "original")
+			current, getErr := client.BatchV1().Jobs(job.Namespace).Get(context.Background(), job.Name, metav1.GetOptions{})
+			if tc.currentUID == "replacement" {
+				if !errors.IsConflict(err) || getErr != nil || current.UID != tc.currentUID {
+					t.Fatalf("replacement was not preserved: delete=%v get=%v current=%v", err, getErr, current)
+				}
+			} else if err != nil || !errors.IsNotFound(getErr) {
+				t.Fatalf("original was not deleted: delete=%v get=%v", err, getErr)
+			}
+		})
 	}
 }

@@ -116,8 +116,9 @@ type ManagerImpl struct {
 }
 
 type endpointInfo struct {
-	e    endpoint
-	opts *pluginapi.DevicePluginOptions
+	e      endpoint
+	opts   *pluginapi.DevicePluginOptions
+	plugin plugin.DevicePlugin
 }
 
 type sourcesReadyStub struct{}
@@ -225,18 +226,20 @@ func (m *ManagerImpl) CleanupPluginDirectory(logger klog.Logger, dir string) err
 
 // PluginConnected is to connect a plugin to a new endpoint.
 // This is done as part of device plugin registration.
-func (m *ManagerImpl) PluginConnected(ctx context.Context, resourceName string, p plugin.DevicePlugin) error {
+func (m *ManagerImpl) PluginConnected(ctx context.Context, resourceName string, p plugin.DevicePlugin, options *pluginapi.DevicePluginOptions) error {
 	logger := klog.FromContext(ctx)
-	options, err := p.API().GetDevicePluginOptions(ctx, &pluginapi.Empty{})
-	if err != nil {
-		return fmt.Errorf("failed to get device plugin options: %v", err)
-	}
 
 	e := newEndpointImpl(p)
 
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-	m.endpoints[resourceName] = endpointInfo{e, options}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.endpoints[resourceName] = endpointInfo{e: e, opts: options, plugin: p}
+	// nil means this connection has not reported inventory yet. An explicit
+	// empty ListAndWatch response creates a non-nil empty set instead.
+	m.healthyDevices[resourceName] = nil
 
 	logger.V(2).Info("Device plugin connected", "resourceName", resourceName)
 	return nil
@@ -244,11 +247,11 @@ func (m *ManagerImpl) PluginConnected(ctx context.Context, resourceName string, 
 
 // PluginDisconnected is to disconnect a plugin from an endpoint.
 // This is done as part of device plugin deregistration.
-func (m *ManagerImpl) PluginDisconnected(logger klog.Logger, resourceName string) {
+func (m *ManagerImpl) PluginDisconnected(logger klog.Logger, resourceName string, p plugin.DevicePlugin) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	if ep, exists := m.endpoints[resourceName]; exists {
+	if ep, exists := m.endpoints[resourceName]; exists && ep.plugin == p {
 		m.markResourceUnhealthy(logger, resourceName)
 		logger.V(2).Info("Endpoint became unhealthy", "resourceName", resourceName)
 
@@ -260,13 +263,24 @@ func (m *ManagerImpl) PluginDisconnected(logger klog.Logger, resourceName string
 // and ensures that an upto date state (e.g. number of devices and device health)
 // is captured. Also, registered device and device to container allocation
 // information is checkpointed to the disk.
-func (m *ManagerImpl) PluginListAndWatchReceiver(logger klog.Logger, resourceName string, resp *pluginapi.ListAndWatchResponse) {
-	m.genericDeviceUpdateCallback(logger, resourceName, resp.Devices)
+func (m *ManagerImpl) PluginListAndWatchReceiver(logger klog.Logger, resourceName string, p plugin.DevicePlugin, resp *pluginapi.ListAndWatchResponse) {
+	m.updateDevices(logger, resourceName, resp.Devices, p)
 }
 
 func (m *ManagerImpl) genericDeviceUpdateCallback(logger klog.Logger, resourceName string, devices []*pluginapi.Device) {
+	m.updateDevices(logger, resourceName, devices, nil)
+}
+
+func (m *ManagerImpl) updateDevices(logger klog.Logger, resourceName string, devices []*pluginapi.Device, p plugin.DevicePlugin) {
 	healthyCount := 0
 	m.mutex.Lock()
+	if p != nil {
+		ep, exists := m.endpoints[resourceName]
+		if !exists || ep.plugin != p || ep.e.isStopped() {
+			m.mutex.Unlock()
+			return
+		}
+	}
 	m.healthyDevices[resourceName] = sets.New[string]()
 	m.unhealthyDevices[resourceName] = sets.New[string]()
 	oldDevices := m.allDevices[resourceName]
@@ -421,7 +435,7 @@ func (m *ManagerImpl) markResourceUnhealthy(logger klog.Logger, resourceName str
 	healthyDevices := sets.New[string]()
 	if _, ok := m.healthyDevices[resourceName]; ok {
 		healthyDevices = m.healthyDevices[resourceName]
-		m.healthyDevices[resourceName] = sets.New[string]()
+		m.healthyDevices[resourceName] = nil
 	}
 	if _, ok := m.unhealthyDevices[resourceName]; !ok {
 		m.unhealthyDevices[resourceName] = sets.New[string]()
@@ -534,9 +548,9 @@ func (m *ManagerImpl) readCheckpoint(logger klog.Logger) error {
 	m.podDevices.fromCheckpointData(logger, podDevices)
 	m.allocatedDevices = m.podDevices.devices()
 	for resource := range registeredDevs {
-		// During start up, creates empty healthyDevices list so that the resource capacity
-		// will stay zero till the corresponding device plugin re-registers.
-		m.healthyDevices[resource] = sets.New[string]()
+		// The restored allocation remains known, but no inventory has been
+		// reported by a current device plugin connection.
+		m.healthyDevices[resource] = nil
 		m.unhealthyDevices[resource] = sets.New[string]()
 		m.endpoints[resource] = endpointInfo{e: newStoppedEndpointImpl(resource), opts: nil}
 	}
@@ -623,7 +637,11 @@ func (m *ManagerImpl) devicesToAllocate(ctx context.Context, podUID, contName, r
 	// Note: we need to check the device health and registration status *before* we check how many devices are needed, doing otherwise caused issue #109595
 	// Note: if the scheduler is bypassed, we fall back in scenario 1, so we still need these checks.
 	if !hasRegistered {
-		return nil, fmt.Errorf("cannot allocate unregistered device %s", resource)
+		return nil, admission.NewDeviceNotReadyError(fmt.Errorf("cannot allocate unregistered device %s", resource))
+	}
+
+	if healthyDevices == nil {
+		return nil, admission.NewDeviceNotReadyError(fmt.Errorf("device plugin has not reported inventory for %s", resource))
 	}
 
 	// Check if registered resource has healthy devices

@@ -1751,7 +1751,8 @@ func TestAllocationManagerAddPodWithPLR(t *testing.T) {
 				allocationManager.AddPodAdmitHandlers(lifecycle.PodAdmitHandlers{handler})
 			}
 
-			ok, reason, message := allocationManager.AddPod(tc.currentActivePods, tc.podToAdd)
+			result := allocationManager.AddPod(tc.currentActivePods, tc.podToAdd)
+			ok, reason, message := result.Admit, result.Reason, result.Message
 			require.Equal(t, tc.expectAdmit, ok)
 			require.Equal(t, tc.admissionFailureReason, reason)
 			require.Equal(t, tc.admissionFailureMessage, message)
@@ -2007,7 +2008,8 @@ func TestAllocationManagerAddPod(t *testing.T) {
 				allocationManager.AddPodAdmitHandlers(lifecycle.PodAdmitHandlers{handler})
 			}
 
-			ok, reason, message := allocationManager.AddPod(tc.currentActivePods, tc.podToAdd)
+			result := allocationManager.AddPod(tc.currentActivePods, tc.podToAdd)
+			ok, reason, message := result.Admit, result.Reason, result.Message
 			require.Equal(t, tc.expectAdmit, ok)
 			require.Equal(t, tc.admissionFailureReason, reason)
 			require.Equal(t, tc.admissionFailureMessage, message)
@@ -2479,4 +2481,78 @@ func setContainerStatus(podStatus *kubecontainer.PodStatus, c *v1.Container, idx
 			MemoryLimit: c.Resources.Limits.Memory(),
 		},
 	}
+}
+
+func TestDeferredAdmissionPreservesAllocationAccounting(t *testing.T) {
+	for _, scaling := range []bool{false, true} {
+		t.Run(fmt.Sprintf("scaling-%t", scaling), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, scaling)
+			newPod := func(uid types.UID, cpu string) *v1.Pod {
+				return &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: uid}, Spec: v1.PodSpec{Containers: []v1.Container{{Name: "c", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse(cpu)}}}}}}
+			}
+			m := &manager{allocated: state.NewStateMemory(nil)}
+			restored := newPod("restored", "1")
+			require.NoError(t, m.SetAllocatedResources(restored))
+			desired := newPod("restored", "2")
+			pending := newPod("pending", "1")
+			competing := newPod("competing", "3")
+			m.AddPodAdmitHandlers(lifecycle.PodAdmitHandlers{&testPodAdmitHandler{admitFunc: func(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
+				if attrs.Pod.UID != competing.UID {
+					return lifecycle.PodAdmitResult{Defer: true, Reason: "DeviceNotReady"}
+				}
+				total := attrs.Pod.Spec.Containers[0].Resources.Requests.Cpu().MilliValue()
+				for _, other := range attrs.OtherPods {
+					total += other.Spec.Containers[0].Resources.Requests.Cpu().MilliValue()
+				}
+				if total > 4000 {
+					return lifecycle.PodAdmitResult{Reason: "OutOfcpu"}
+				}
+				return lifecycle.PodAdmitResult{Admit: true}
+			}}})
+			active := []*v1.Pod{desired, pending}
+			require.True(t, m.AddPod(active, desired).Defer)
+			require.True(t, m.AddPod(active, pending).Defer)
+			restoredAllocation, found := m.GetContainerResourceAllocation(restored.UID, "c")
+			require.True(t, found)
+			require.Equal(t, int64(1000), restoredAllocation.Requests.Cpu().MilliValue(), "deferral must preserve the restored allocation")
+			_, found = m.GetContainerResourceAllocation(pending.UID, "c")
+			require.False(t, found, "a new deferred Pod must not be checkpointed as admitted")
+			result := m.AddPod(active, competing)
+			require.False(t, result.Admit)
+			require.False(t, result.Defer, "real resource pressure is not an inventory wait")
+			require.Equal(t, "OutOfcpu", result.Reason)
+			allocated := m.getAllocatedPods(active)
+			want := int64(2000)
+			if scaling {
+				want = 1000
+			}
+			require.Equal(t, want, allocated[0].Spec.Containers[0].Resources.Requests.Cpu().MilliValue())
+		})
+	}
+}
+
+func TestDeferredAdmissionEvaluatingUsesSameStateMap(t *testing.T) {
+	m := &manager{allocated: state.NewStateMemory(nil)}
+	uid := types.UID("evaluating")
+	m.BeginPodAdmission(uid)
+	require.True(t, m.IsPodAdmissionPending(uid))
+	require.False(t, m.IsPodAdmissionDeferred(uid))
+	require.Empty(t, m.SnapshotDeferredAdmissions(), "initial evaluation does not start the device timeout")
+	m.BeginPodAdmission(uid)
+	first := time.Time{}
+	m.MarkPodAdmissionDeferred(uid, first)
+	require.True(t, m.IsPodAdmissionDeferred(uid), "zero is a valid fake clock timestamp")
+	stamp, found := m.SnapshotDeferredAdmissions()[uid]
+	require.True(t, found)
+	require.Equal(t, first, stamp)
+	m.BeginPodAdmission(uid)
+	m.MarkPodAdmissionDeferred(uid, first.Add(time.Hour))
+	require.Equal(t, first, m.SnapshotDeferredAdmissions()[uid], "duplicate publication cannot extend the original deadline")
+	m.RemovePod(uid)
+	require.False(t, m.IsPodAdmissionPending(uid))
+	m.BeginPodAdmission("orphan")
+	m.BeginPodAdmission("kept")
+	m.RemoveOrphanedPods(sets.New[types.UID]("kept"))
+	require.False(t, m.IsPodAdmissionPending("orphan"))
+	require.True(t, m.IsPodAdmissionPending("kept"))
 }
