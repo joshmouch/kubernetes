@@ -2484,6 +2484,7 @@ func setContainerStatus(podStatus *kubecontainer.PodStatus, c *v1.Container, idx
 }
 
 func TestDeferredAdmissionPreservesAllocationAccounting(t *testing.T) {
+	featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.34"))
 	for _, scaling := range []bool{false, true} {
 		t.Run(fmt.Sprintf("scaling-%t", scaling), func(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, scaling)
