@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
+	crierror "k8s.io/cri-api/pkg/errors"
 	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/container"
@@ -331,6 +332,11 @@ func (im *realImageGCManager) handleImageVolumes(ctx context.Context, imagesInUs
 
 	status, err := im.runtime.GetContainerStatus(ctx, pod.ID, container.ID)
 	if err != nil {
+		// A container may be removed after GetPods enumerates it. Like the
+		// pod-status path, ignore only that normal disappearance.
+		if crierror.IsNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("get container status: %w", err)
 	}
 

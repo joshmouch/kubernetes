@@ -26,11 +26,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
+	"k8s.io/apimachinery/pkg/types"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/container"
@@ -942,5 +946,150 @@ func TestValidateImageGCPolicy(t *testing.T) {
 				t.Errorf("[%s:]Expected err:%v, but got:%v", tc.name, tc.expectErr, err.Error())
 			}
 		}
+	}
+}
+
+// imageGCContainerStatusRuntime keeps the native FakeRuntime enumeration and
+// overrides only the per-container status boundary that can race with removal.
+type imageGCContainerStatusRuntime struct {
+	container.Runtime
+	getContainerStatus func(context.Context, types.UID, container.ContainerID) (*container.Status, error)
+}
+
+func (r *imageGCContainerStatusRuntime) GetContainerStatus(ctx context.Context, podUID types.UID, id container.ContainerID) (*container.Status, error) {
+	return r.getContainerStatus(ctx, podUID, id)
+}
+
+func TestDetectImagesContainerDisappearsBetweenListAndStatus(t *testing.T) {
+	for _, wrapDepth := range []int{0, 1, 2} {
+		t.Run(fmt.Sprintf("wrap-depth-%d", wrapDepth), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ImageVolume, true)
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RuntimeClassInImageCriAPI, false)
+			ctx := ktesting.Init(t)
+			mockStatsProvider := statstest.NewMockProvider(t)
+			policy := ImageGCPolicy{HighThresholdPercent: 70, LowThresholdPercent: 60, MinAge: time.Hour}
+			manager, fakeRuntime := newRealImageGCManager(policy, mockStatsProvider)
+			imageFs := &statsapi.FsStats{AvailableBytes: ptr.To(uint64(900)), CapacityBytes: ptr.To(uint64(1000))}
+			mockStatsProvider.EXPECT().ImageFsStats(mock.Anything).Return(imageFs, imageFs, nil)
+			fakeRuntime.ImageList = []container.Image{makeImage(0, 1024), makeImage(1, 2048), makeImage(2, 4096)}
+			vanished, surviving := makeContainer(0), makeContainer(1)
+			fakeRuntime.AllPodList = []*containertest.FakePod{{Pod: &container.Pod{
+				ID:         "original-pod",
+				Containers: []*container.Container{vanished, surviving},
+			}}}
+			var statusCalls []string
+			manager.runtime = &imageGCContainerStatusRuntime{
+				Runtime: fakeRuntime,
+				getContainerStatus: func(_ context.Context, podUID types.UID, id container.ContainerID) (*container.Status, error) {
+					require.Equal(t, types.UID("original-pod"), podUID)
+					statusCalls = append(statusCalls, id.ID)
+					switch id {
+					case vanished.ID:
+						// GetPods already returned this container. Remove it before
+						// the status lookup, without changing that enumeration.
+						fakeRuntime.AllPodList[0].Pod.Containers = []*container.Container{surviving}
+						err := grpcstatus.Error(codes.NotFound, "container disappeared after enumeration")
+						for depth := 0; depth < wrapDepth; depth++ {
+							if depth == 0 {
+								err = fmt.Errorf("runtime container status: %w", err)
+							} else {
+								err = fmt.Errorf("get container status: %w", err)
+							}
+						}
+						return nil, err
+					case surviving.ID:
+						return &container.Status{ID: id, Mounts: []container.Mount{
+							{Image: &runtimeapi.ImageSpec{Image: imageID(2)}},
+						}}, nil
+					default:
+						t.Fatalf("unexpected status lookup for %q", id.ID)
+						return nil, nil
+					}
+				},
+			}
+
+			// Exercise the public image-GC pass, including its normal filesystem
+			// decision after detection. MaxAge is disabled, MinAge is one hour,
+			// and 10% usage is below the 70% high threshold: no image is removed.
+			require.NoError(t, manager.GarbageCollect(ctx, time.Now()))
+			require.Equal(t, []string{vanished.ID.ID, surviving.ID.ID}, statusCalls)
+			require.Len(t, manager.imageRecords, 3)
+			// The vanished container's ordinary image remains conservatively
+			// protected for this snapshot; both surviving references are retained.
+			for _, id := range []string{imageID(0), imageID(1), imageID(2)} {
+				record, ok := manager.getImageRecord(id)
+				require.True(t, ok, id)
+				require.False(t, record.lastUsed.IsZero(), id)
+			}
+			require.NotContains(t, fakeRuntime.CalledFunctions, "RemoveImage")
+
+			// On the next fresh enumeration only the vanished container's image
+			// enters eviction order; live ordinary and mounted images stay protected.
+			evictable, err := manager.imagesInEvictionOrder(ctx, time.Now())
+			require.NoError(t, err)
+			require.Len(t, evictable, 1)
+			require.Equal(t, imageID(0), evictable[0].id)
+			require.Equal(t, []string{vanished.ID.ID, surviving.ID.ID, surviving.ID.ID}, statusCalls)
+		})
+	}
+}
+
+func TestDetectImagesContainerStatusErrorsRemainFailures(t *testing.T) {
+	for name, statusErr := range map[string]error{
+		"unavailable":                 grpcstatus.Error(codes.Unavailable, "runtime unavailable"),
+		"wrapped-unavailable":         fmt.Errorf("runtime container status: %w", grpcstatus.Error(codes.Unavailable, "runtime unavailable")),
+		"internal":                    grpcstatus.Error(codes.Internal, "runtime internal failure"),
+		"unknown":                     grpcstatus.Error(codes.Unknown, "status unavailable"),
+		"permission-denied":           grpcstatus.Error(codes.PermissionDenied, "status denied"),
+		"text-is-not-typed-not-found": fmt.Errorf("runtime container status: container not found"),
+		"nil-status-error":            fmt.Errorf("container status is nil"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ImageVolume, true)
+			ctx := ktesting.Init(t)
+			manager, fakeRuntime := newRealImageGCManager(ImageGCPolicy{}, statstest.NewMockProvider(t))
+			fakeRuntime.ImageList = []container.Image{makeImage(0, 1024)}
+			fakeRuntime.AllPodList = []*containertest.FakePod{{Pod: &container.Pod{Containers: []*container.Container{makeContainer(0)}}}}
+			manager.runtime = &imageGCContainerStatusRuntime{Runtime: fakeRuntime,
+				getContainerStatus: func(context.Context, types.UID, container.ContainerID) (*container.Status, error) {
+					return nil, statusErr
+				},
+			}
+			_, err := manager.detectImages(ctx, zero)
+			require.ErrorIs(t, err, statusErr)
+			require.ErrorContains(t, err, "get container status:")
+			require.Empty(t, manager.imageRecords)
+		})
+	}
+}
+
+func TestDetectImagesImageVolumeDisabledDoesNotQueryStatus(t *testing.T) {
+	for _, runtimeHandlerEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("runtime-handler-%t", runtimeHandlerEnabled), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ImageVolume, false)
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RuntimeClassInImageCriAPI, runtimeHandlerEnabled)
+			ctx := ktesting.Init(t)
+			manager, fakeRuntime := newRealImageGCManager(ImageGCPolicy{}, statstest.NewMockProvider(t))
+			fakeRuntime.ImageList = []container.Image{makeImageWithRuntimeHandler(0, 1024, "handler")}
+			live := makeContainer(0)
+			live.ImageRuntimeHandler = "handler"
+			fakeRuntime.AllPodList = []*containertest.FakePod{{Pod: &container.Pod{Containers: []*container.Container{live}}}}
+			manager.runtime = &imageGCContainerStatusRuntime{Runtime: fakeRuntime,
+				getContainerStatus: func(context.Context, types.UID, container.ContainerID) (*container.Status, error) {
+					t.Fatal("image-volume status lookup while ImageVolume is disabled")
+					return nil, nil
+				},
+			}
+			inUse, err := manager.detectImages(ctx, zero)
+			require.NoError(t, err)
+			key := imageID(0)
+			if runtimeHandlerEnabled {
+				key = getImageTuple(key, "handler")
+			}
+			require.True(t, inUse.Has(key))
+			evictable, err := manager.imagesInEvictionOrder(ctx, time.Now())
+			require.NoError(t, err)
+			require.Empty(t, evictable)
+		})
 	}
 }
