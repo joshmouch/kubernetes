@@ -115,14 +115,17 @@ func (s *server) Start(logger klog.Logger) error {
 		return err
 	}
 
-	s.wg.Add(1)
-	s.grpc = grpc.NewServer([]grpc.ServerOption{}...)
+	grpcServer := grpc.NewServer([]grpc.ServerOption{}...)
+	api.RegisterRegistrationServer(grpcServer, s)
 
-	api.RegisterRegistrationServer(s.grpc, s)
+	s.mutex.Lock()
+	s.grpc = grpcServer
+	s.wg.Add(1)
+	s.mutex.Unlock()
 	go func() {
 		defer s.wg.Done()
 		s.setHealthy()
-		if err = s.grpc.Serve(ln); err != nil {
+		if err := grpcServer.Serve(ln); err != nil {
 			s.setUnhealthy(err)
 			logger.Error(err, "Error while serving device plugin registration grpc server")
 		}
@@ -205,16 +208,22 @@ func (s *server) Name() string {
 }
 
 func (s *server) Check(_ *http.Request) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	return s.lastError
 }
 
 // setHealthy sets the health status of the gRPC server.
 func (s *server) setHealthy() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	s.lastError = nil
 }
 
 // setUnhealthy sets the health status of the gRPC server to unhealthy.
 func (s *server) setUnhealthy(err error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	if err == nil {
 		s.lastError = fmt.Errorf("device registration error: device plugin registration gRPC server failed and no device plugins can register")
 		return

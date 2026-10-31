@@ -18,9 +18,11 @@ package v1beta1
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -112,6 +114,10 @@ type handshakeHandler struct {
 	connected    map[string]DevicePlugin
 	publications map[string]int
 	inventory    int
+}
+
+func (h *handshakeHandler) CleanupPluginDirectory(_ klog.Logger, _ string) error {
+	return nil
 }
 
 func (h *handshakeHandler) PluginConnected(_ context.Context, resource string, p DevicePlugin, _ *api.DevicePluginOptions) error {
@@ -339,4 +345,74 @@ func TestPendingDialCannotPublishAfterRemoval(t *testing.T) {
 			}()
 		})
 	}
+}
+
+func TestServerStartStopRetainsServingInstance(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	h := &handshakeHandler{connected: make(map[string]DevicePlugin), publications: make(map[string]int)}
+	created, err := NewServer(logger, filepath.Join(t.TempDir(), "kubelet.sock"), h, h)
+	require.NoError(t, err)
+	s := created.(*server)
+	t.Cleanup(func() { require.NoError(t, s.Stop(logger)) })
+
+	// Start returns before Serve must run. Stop must retain that same instance
+	// and join its goroutine even when it detaches the published pointer first.
+	require.NoError(t, s.Start(logger))
+	s.mutex.Lock()
+	first := s.grpc
+	s.mutex.Unlock()
+	require.NotNil(t, first)
+	require.NoError(t, s.Stop(logger))
+	require.NoError(t, s.Check(nil))
+	s.mutex.Lock()
+	stopped := s.grpc
+	s.mutex.Unlock()
+	require.Nil(t, stopped)
+
+	// A subsequent start owns another native server, without an old waiter.
+	require.NoError(t, s.Start(logger))
+	s.mutex.Lock()
+	restarted := s.grpc
+	s.mutex.Unlock()
+	require.NotNil(t, restarted)
+	require.NotSame(t, first, restarted)
+	require.NoError(t, s.Stop(logger))
+	require.NoError(t, s.Check(nil))
+}
+
+func TestServerHealthConcurrentAccess(t *testing.T) {
+	s := &server{}
+	failure := errors.New("native serving failure")
+	start := make(chan struct{})
+	entered := make(chan struct{}, 2)
+	var done sync.WaitGroup
+	done.Add(2)
+	s.mutex.Lock()
+	go func() {
+		defer done.Done()
+		<-start
+		entered <- struct{}{}
+		s.setUnhealthy(failure)
+		s.setHealthy()
+	}()
+	go func() {
+		defer done.Done()
+		<-start
+		entered <- struct{}{}
+		_ = s.Check(nil)
+	}()
+	close(start)
+	<-entered
+	<-entered
+	s.mutex.Unlock()
+	done.Wait()
+
+	s.setUnhealthy(failure)
+	require.ErrorIs(t, s.Check(nil), failure)
+	s.setUnhealthy(nil)
+	require.EqualError(t, s.Check(nil), "device registration error: device plugin registration gRPC server failed and no device plugins can register")
+	s.setHealthy()
+	require.NoError(t, s.Check(nil))
 }
