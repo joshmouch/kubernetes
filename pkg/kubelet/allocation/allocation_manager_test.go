@@ -2498,6 +2498,9 @@ func TestDeferredAdmissionPreservesAllocationAccounting(t *testing.T) {
 			pending := newPod("pending", "1")
 			competing := newPod("competing", "3")
 			m.AddPodAdmitHandlers(lifecycle.PodAdmitHandlers{&testPodAdmitHandler{admitFunc: func(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
+				for _, other := range attrs.OtherPods {
+					require.NotEqual(t, attrs.Pod.UID, other.UID, "the admission candidate must be excluded from other Pods")
+				}
 				if attrs.Pod.UID != competing.UID {
 					return lifecycle.PodAdmitResult{Defer: true, Reason: "DeviceNotReady"}
 				}
@@ -2511,14 +2514,18 @@ func TestDeferredAdmissionPreservesAllocationAccounting(t *testing.T) {
 				return lifecycle.PodAdmitResult{Admit: true}
 			}}})
 			active := []*v1.Pod{desired, pending}
+			originalActive := append([]*v1.Pod(nil), active...)
 			require.True(t, m.AddPod(active, desired).Defer)
+			require.Equal(t, originalActive, active, "admission must preserve the caller's active Pod slice")
 			require.True(t, m.AddPod(active, pending).Defer)
+			require.Equal(t, originalActive, active, "repeated admission must preserve the caller's active Pod slice")
 			restoredAllocation, found := m.GetContainerResourceAllocation(restored.UID, "c")
 			require.True(t, found)
 			require.Equal(t, int64(1000), restoredAllocation.Requests.Cpu().MilliValue(), "deferral must preserve the restored allocation")
 			_, found = m.GetContainerResourceAllocation(pending.UID, "c")
 			require.False(t, found, "a new deferred Pod must not be checkpointed as admitted")
 			result := m.AddPod(active, competing)
+			require.Equal(t, originalActive, active, "rejected admission must preserve the caller's active Pod slice")
 			require.False(t, result.Admit)
 			require.False(t, result.Defer, "real resource pressure is not an inventory wait")
 			require.Equal(t, "OutOfcpu", result.Reason)

@@ -690,8 +690,8 @@ func (m *manager) handlePodResourcesResize(logger klog.Logger, pod *v1.Pod) (boo
 // allocatedPods should represent the pods that have already been admitted, along with their
 // admitted (allocated) resources.
 func (m *manager) canAdmitPod(logger klog.Logger, allocatedPods []*v1.Pod, pod *v1.Pod, operation lifecycle.Operation) lifecycle.PodAdmitResult {
-	// Filter out the pod being evaluated.
-	allocatedPods = slices.DeleteFunc(allocatedPods, func(p *v1.Pod) bool { return p.UID == pod.UID })
+	// Filter out the pod being evaluated without modifying the caller's slice.
+	allocatedPods = slices.DeleteFunc(slices.Clone(allocatedPods), func(p *v1.Pod) bool { return p.UID == pod.UID })
 
 	// If any handler rejects, the pod is rejected.
 	attrs := &lifecycle.PodAdmitAttributes{Pod: pod, OtherPods: allocatedPods, Operation: operation}
