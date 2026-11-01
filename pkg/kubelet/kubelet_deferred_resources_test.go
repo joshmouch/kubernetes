@@ -29,6 +29,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	clientfake "k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet/clustertrustbundle"
@@ -121,6 +123,10 @@ func TestDeferredAdmissionVolumeCachePopulationAndRelease(t *testing.T) {
 			tCtx := ktesting.Init(t)
 			tk, h := newDeferredAdmissionKubelet(t)
 			defer tk.Cleanup()
+			// Give API actions native object storage without replacing the shared client.
+			objectReaction := clienttesting.ObjectReaction(clientfake.NewClientset().Tracker())
+			tk.fakeKubeClient.AddReactor("*", "configmaps", objectReaction)
+			tk.fakeKubeClient.AddReactor("*", "secrets", objectReaction)
 			kl := tk.kubelet
 			kl.configMapManager = configmap.NewCachingConfigMapManager(tk.fakeKubeClient, cachemanager.GetObjectTTLFromNodeFunc(kl.GetNode))
 			kl.secretManager = secret.NewCachingSecretManager(tk.fakeKubeClient, cachemanager.GetObjectTTLFromNodeFunc(kl.GetNode))
@@ -133,6 +139,12 @@ func TestDeferredAdmissionVolumeCachePopulationAndRelease(t *testing.T) {
 			require.NoError(t, err)
 			_, err = tk.fakeKubeClient.CoreV1().Secrets(pod.Namespace).Create(tCtx, &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credential", Namespace: pod.Namespace}, Data: map[string][]byte{"key": []byte("native-secret")}}, metav1.CreateOptions{})
 			require.NoError(t, err)
+			storedConfigMap, err := tk.fakeKubeClient.CoreV1().ConfigMaps(pod.Namespace).Get(tCtx, "configuration", metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, map[string]string{"key": "native-value"}, storedConfigMap.Data)
+			storedSecret, err := tk.fakeKubeClient.CoreV1().Secrets(pod.Namespace).Get(tCtx, "credential", metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, "native-secret", string(storedSecret.Data["key"]))
 			_, err = kl.configMapManager.GetConfigMap(pod.Namespace, "configuration")
 			require.ErrorContains(t, err, "not registered", "the control reproduces the original cache precondition")
 
@@ -146,8 +158,9 @@ func TestDeferredAdmissionVolumeCachePopulationAndRelease(t *testing.T) {
 			// This actual native ConfigMap volume SetUp runs before desired publication,
 			// before deferral is marked, and without SyncPod registering anything.
 			kl.podManager = &deferredResourcePodManager{Manager: kl.podManager, beforePublish: func(p *v1.Pod) {
-				_, getErr := kl.secretManager.GetSecret(p.Namespace, "credential")
+				storedSecret, getErr := kl.secretManager.GetSecret(p.Namespace, "credential")
 				require.NoError(t, getErr)
+				require.Equal(t, "native-secret", string(storedSecret.Data["key"]))
 				require.NoError(t, mounter.SetUp(volume.MounterArgs{}))
 			}}
 			workers, _, _ := createPodWorkers(klog.FromContext(tCtx))
@@ -215,6 +228,8 @@ func TestDeferredAdmissionPublicationRetainsOwnershipDuringEvaluation(t *testing
 			tCtx := ktesting.Init(t)
 			tk, h := newDeferredAdmissionKubelet(t)
 			defer tk.Cleanup()
+			// Give API actions native object storage without replacing the shared client.
+			tk.fakeKubeClient.AddReactor("*", "configmaps", clienttesting.ObjectReaction(clientfake.NewClientset().Tracker()))
 			kl := tk.kubelet
 			kl.configMapManager = configmap.NewCachingConfigMapManager(tk.fakeKubeClient, cachemanager.GetObjectTTLFromNodeFunc(kl.GetNode))
 			pod := newDeferTestPod("publication-" + outcome)
@@ -223,6 +238,9 @@ func TestDeferredAdmissionPublicationRetainsOwnershipDuringEvaluation(t *testing
 			pod.Spec.Containers[0].VolumeMounts = []v1.VolumeMount{{Name: "config", MountPath: "/configuration"}}
 			_, err := tk.fakeKubeClient.CoreV1().ConfigMaps(pod.Namespace).Create(tCtx, &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "publication", Namespace: pod.Namespace}, Data: map[string]string{"key": "published-value"}}, metav1.CreateOptions{})
 			require.NoError(t, err)
+			storedConfigMap, err := tk.fakeKubeClient.CoreV1().ConfigMaps(pod.Namespace).Get(tCtx, "publication", metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, map[string]string{"key": "published-value"}, storedConfigMap.Data)
 			plugins := append(volumeconfigmap.ProbeVolumePlugins(), emptydir.ProbeVolumePlugins()...)
 			kl.volumePluginMgr, err = NewInitializedVolumePluginMgr(kl, kl.secretManager, kl.configMapManager, token.NewManager(kl.kubeClient), &clustertrustbundle.NoopManager{}, plugins, nil)
 			require.NoError(t, err)
@@ -271,13 +289,17 @@ func TestDeferredAdmissionPublicationRetainsOwnershipDuringEvaluation(t *testing
 			require.False(t, workers.ShouldPodRuntimeBeRemoved(pod.UID))
 			require.False(t, workers.ShouldPodContentBeRemoved(pod.UID))
 			require.False(t, workers.ShouldPodContainersBeTerminating(pod.UID))
-			_, err = kl.configMapManager.GetConfigMap(pod.Namespace, "publication")
+			storedConfigMap, err = kl.configMapManager.GetConfigMap(pod.Namespace, "publication")
 			require.NoError(t, err)
+			require.Equal(t, map[string]string{"key": "published-value"}, storedConfigMap.Data)
 			plugin, err := kl.volumePluginMgr.FindPluginBySpec(volume.NewSpecFromVolume(&pod.Spec.Volumes[0]))
 			require.NoError(t, err)
 			mounter, err := plugin.NewMounter(volume.NewSpecFromVolume(&pod.Spec.Volumes[0]), pod)
 			require.NoError(t, err)
 			require.NoError(t, mounter.SetUp(volume.MounterArgs{}))
+			data, err := os.ReadFile(filepath.Join(mounter.GetPath(), "key"))
+			require.NoError(t, err)
+			require.Equal(t, "published-value", string(data))
 			unmounter, err := plugin.NewUnmounter("config", pod.UID)
 			require.NoError(t, err)
 			defer func() { require.NoError(t, unmounter.TearDown()) }()
