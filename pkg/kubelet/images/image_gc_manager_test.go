@@ -31,6 +31,7 @@ import (
 
 	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/version"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
@@ -1064,6 +1065,7 @@ func TestDetectImagesContainerStatusErrorsRemainFailures(t *testing.T) {
 }
 
 func TestDetectImagesImageVolumeDisabledDoesNotQueryStatus(t *testing.T) {
+	featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.35"))
 	for _, runtimeHandlerEnabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("runtime-handler-%t", runtimeHandlerEnabled), func(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ImageVolume, false)
