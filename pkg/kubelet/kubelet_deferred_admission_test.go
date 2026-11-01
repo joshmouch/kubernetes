@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/version"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/features"
@@ -405,6 +406,7 @@ func TestDeferredAdmissionCleanupStillTerminatesRuntimeOrphans(t *testing.T) {
 }
 
 func TestDeferredAdmissionDeletionRetriesTerminationBeforeAdmission(t *testing.T) {
+	featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.34"))
 	for _, scaling := range []bool{false, true} {
 		t.Run(map[bool]string{false: "scaling-off", true: "scaling-on"}[scaling], func(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, scaling)

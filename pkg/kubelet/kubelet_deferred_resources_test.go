@@ -39,6 +39,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/secret"
 	"k8s.io/kubernetes/pkg/kubelet/token"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+	cachemanager "k8s.io/kubernetes/pkg/kubelet/util/manager"
 	volumecache "k8s.io/kubernetes/pkg/kubelet/volumemanager/cache"
 	"k8s.io/kubernetes/pkg/kubelet/volumemanager/populator"
 	"k8s.io/kubernetes/pkg/volume"
@@ -121,8 +122,8 @@ func TestDeferredAdmissionVolumeCachePopulationAndRelease(t *testing.T) {
 			tk, h := newDeferredAdmissionKubelet(t)
 			defer tk.Cleanup()
 			kl := tk.kubelet
-			kl.configMapManager = configmap.NewCachingConfigMapManager(tk.fakeKubeClient, nil)
-			kl.secretManager = secret.NewCachingSecretManager(tk.fakeKubeClient, nil)
+			kl.configMapManager = configmap.NewCachingConfigMapManager(tk.fakeKubeClient, cachemanager.GetObjectTTLFromNodeFunc(kl.GetNode))
+			kl.secretManager = secret.NewCachingSecretManager(tk.fakeKubeClient, cachemanager.GetObjectTTLFromNodeFunc(kl.GetNode))
 			pod := newDeferTestPod("volume-" + ending)
 			mode := int32(0644)
 			pod.Spec.Volumes = []v1.Volume{{Name: "config", VolumeSource: v1.VolumeSource{ConfigMap: &v1.ConfigMapVolumeSource{LocalObjectReference: v1.LocalObjectReference{Name: "configuration"}, DefaultMode: &mode}}}}
@@ -215,7 +216,7 @@ func TestDeferredAdmissionPublicationRetainsOwnershipDuringEvaluation(t *testing
 			tk, h := newDeferredAdmissionKubelet(t)
 			defer tk.Cleanup()
 			kl := tk.kubelet
-			kl.configMapManager = configmap.NewCachingConfigMapManager(tk.fakeKubeClient, nil)
+			kl.configMapManager = configmap.NewCachingConfigMapManager(tk.fakeKubeClient, cachemanager.GetObjectTTLFromNodeFunc(kl.GetNode))
 			pod := newDeferTestPod("publication-" + outcome)
 			mode := int32(0644)
 			pod.Spec.Volumes = []v1.Volume{{Name: "config", VolumeSource: v1.VolumeSource{ConfigMap: &v1.ConfigMapVolumeSource{LocalObjectReference: v1.LocalObjectReference{Name: "publication"}, DefaultMode: &mode}}}}
@@ -345,8 +346,8 @@ func TestDeferredAdmissionMirrorNotificationsDoNotOwnReferencesOrDispatch(t *tes
 	tk, h := newDeferredAdmissionKubelet(t)
 	defer tk.Cleanup()
 	kl := tk.kubelet
-	cm := &deferredTrackingConfigMapManager{Manager: configmap.NewCachingConfigMapManager(tk.fakeKubeClient, nil), registered: map[types.UID]bool{}}
-	sm := &deferredTrackingSecretManager{Manager: secret.NewCachingSecretManager(tk.fakeKubeClient, nil), registered: map[types.UID]bool{}}
+	cm := &deferredTrackingConfigMapManager{Manager: configmap.NewCachingConfigMapManager(tk.fakeKubeClient, cachemanager.GetObjectTTLFromNodeFunc(kl.GetNode)), registered: map[types.UID]bool{}}
+	sm := &deferredTrackingSecretManager{Manager: secret.NewCachingSecretManager(tk.fakeKubeClient, cachemanager.GetObjectTTLFromNodeFunc(kl.GetNode)), registered: map[types.UID]bool{}}
 	kl.configMapManager, kl.secretManager = cm, sm
 	dispatched := recordDispatches(kl)
 	h.deferResult = true
