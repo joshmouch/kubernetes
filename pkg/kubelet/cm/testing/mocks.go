@@ -801,16 +801,16 @@ func (_c *MockContainerManager_GetNodeAllocatableAbsolute_Call) RunAndReturn(run
 }
 
 // GetNodeAllocatableReservation provides a mock function for the type MockContainerManager
-func (_mock *MockContainerManager) GetNodeAllocatableReservation() v1.ResourceList {
-	ret := _mock.Called()
+func (_mock *MockContainerManager) GetNodeAllocatableReservation(capacity v1.ResourceList) v1.ResourceList {
+	ret := _mock.Called(capacity)
 
 	if len(ret) == 0 {
 		panic("no return value specified for GetNodeAllocatableReservation")
 	}
 
 	var r0 v1.ResourceList
-	if returnFunc, ok := ret.Get(0).(func() v1.ResourceList); ok {
-		r0 = returnFunc()
+	if returnFunc, ok := ret.Get(0).(func(v1.ResourceList) v1.ResourceList); ok {
+		r0 = returnFunc(capacity)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(v1.ResourceList)
@@ -825,13 +825,20 @@ type MockContainerManager_GetNodeAllocatableReservation_Call struct {
 }
 
 // GetNodeAllocatableReservation is a helper method to define mock.On call
-func (_e *MockContainerManager_Expecter) GetNodeAllocatableReservation() *MockContainerManager_GetNodeAllocatableReservation_Call {
-	return &MockContainerManager_GetNodeAllocatableReservation_Call{Call: _e.mock.On("GetNodeAllocatableReservation")}
+//   - capacity v1.ResourceList
+func (_e *MockContainerManager_Expecter) GetNodeAllocatableReservation(capacity interface{}) *MockContainerManager_GetNodeAllocatableReservation_Call {
+	return &MockContainerManager_GetNodeAllocatableReservation_Call{Call: _e.mock.On("GetNodeAllocatableReservation", capacity)}
 }
 
-func (_c *MockContainerManager_GetNodeAllocatableReservation_Call) Run(run func()) *MockContainerManager_GetNodeAllocatableReservation_Call {
+func (_c *MockContainerManager_GetNodeAllocatableReservation_Call) Run(run func(capacity v1.ResourceList)) *MockContainerManager_GetNodeAllocatableReservation_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run()
+		var arg0 v1.ResourceList
+		if args[0] != nil {
+			arg0 = args[0].(v1.ResourceList)
+		}
+		run(
+			arg0,
+		)
 	})
 	return _c
 }
@@ -841,7 +848,7 @@ func (_c *MockContainerManager_GetNodeAllocatableReservation_Call) Return(resour
 	return _c
 }
 
-func (_c *MockContainerManager_GetNodeAllocatableReservation_Call) RunAndReturn(run func() v1.ResourceList) *MockContainerManager_GetNodeAllocatableReservation_Call {
+func (_c *MockContainerManager_GetNodeAllocatableReservation_Call) RunAndReturn(run func(capacity v1.ResourceList) v1.ResourceList) *MockContainerManager_GetNodeAllocatableReservation_Call {
 	_c.Call.Return(run)
 	return _c
 }

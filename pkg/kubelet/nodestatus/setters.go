@@ -198,7 +198,7 @@ func MachineInfo(nodeName string,
 	machineInfoFunc func() (*cadvisorapiv1.MachineInfo, error), // typically Kubelet.GetCachedMachineInfo
 	capacityFunc func(localStorageCapacityIsolation bool) v1.ResourceList, // typically Kubelet.containerManager.GetCapacity
 	devicePluginResourceCapacityFunc func() (v1.ResourceList, v1.ResourceList, []string), // typically Kubelet.containerManager.GetDevicePluginResourceCapacity
-	nodeAllocatableReservationFunc func() v1.ResourceList, // typically Kubelet.containerManager.GetNodeAllocatableReservation
+	nodeAllocatableReservationFunc func(v1.ResourceList) v1.ResourceList, // typically Kubelet.containerManager.GetNodeAllocatableReservation
 	recordEventFunc func(eventType, event, message string), // typically Kubelet.recordEvent
 	localStorageCapacityIsolation bool,
 ) Setter {
@@ -253,15 +253,6 @@ func MachineInfo(nodeName string,
 			}
 			node.Status.NodeInfo.BootID = info.BootID
 
-			// TODO: all the node resources should use ContainerManager.GetCapacity instead of deriving the
-			// capacity for every node status request
-			initialCapacity := capacityFunc(localStorageCapacityIsolation)
-			if initialCapacity != nil {
-				if v, exists := initialCapacity[v1.ResourceEphemeralStorage]; exists {
-					node.Status.Capacity[v1.ResourceEphemeralStorage] = v
-				}
-			}
-
 			devicePluginCapacity, devicePluginAllocatable, removedDevicePlugins = devicePluginResourceCapacityFunc()
 			for k, v := range devicePluginCapacity {
 				if old, ok := node.Status.Capacity[k]; !ok || old.Value() != v.Value() {
@@ -290,6 +281,18 @@ func MachineInfo(nodeName string,
 			}
 		}
 
+		// Memory remains the last capacity accepted by the container manager,
+		// including when a new physical machine-information read fails.
+		acceptedCapacity := capacityFunc(localStorageCapacityIsolation)
+		if memory, exists := acceptedCapacity[v1.ResourceMemory]; exists {
+			node.Status.Capacity[v1.ResourceMemory] = memory
+		}
+		if err == nil {
+			if storage, exists := acceptedCapacity[v1.ResourceEphemeralStorage]; exists {
+				node.Status.Capacity[v1.ResourceEphemeralStorage] = storage
+			}
+		}
+
 		// Set Allocatable.
 		if node.Status.Allocatable == nil {
 			node.Status.Allocatable = make(v1.ResourceList)
@@ -302,7 +305,7 @@ func MachineInfo(nodeName string,
 				delete(node.Status.Allocatable, k)
 			}
 		}
-		allocatableReservation := nodeAllocatableReservationFunc()
+		allocatableReservation := nodeAllocatableReservationFunc(node.Status.Capacity)
 		for k, v := range node.Status.Capacity {
 			value := v.DeepCopy()
 			if res, exists := allocatableReservation[k]; exists {

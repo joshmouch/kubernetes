@@ -116,8 +116,9 @@ type kubeGenericRuntimeManager struct {
 	recorder    record.EventRecorderLogger
 	osInterface kubecontainer.OSInterface
 
-	// machineInfo contains the machine information.
-	machineInfo *cadvisorapi.MachineInfo
+	// getMachineInfo reads the cAdvisor-owned current machine-information cache.
+	getMachineInfo func() (*cadvisorapi.MachineInfo, error)
+	machineID      string
 
 	// Container GC manager
 	containerGC *containerGC
@@ -219,7 +220,7 @@ func NewKubeGenericRuntimeManager(
 	startupManager proberesults.Manager,
 	rootDirectory string,
 	podLogsDirectory string,
-	machineInfo *cadvisorapi.MachineInfo,
+	getMachineInfo func() (*cadvisorapi.MachineInfo, error),
 	podStateProvider podStateProvider,
 	maxPods int32,
 	osInterface kubecontainer.OSInterface,
@@ -254,6 +255,13 @@ func NewKubeGenericRuntimeManager(
 	podInitContainerTimeRecorder PodInitContainerTimeRecorder,
 ) (KubeGenericRuntime, []images.PostImageGCHook, error) {
 	logger := klog.FromContext(ctx)
+	machineInfo, err := getMachineInfo()
+	if err != nil {
+		return nil, nil, fmt.Errorf("get current machine information: %w", err)
+	}
+	if machineInfo == nil {
+		return nil, nil, fmt.Errorf("machine information is unavailable")
+	}
 
 	runtimeService = newInstrumentedRuntimeService(runtimeService)
 	imageService = newInstrumentedImageManagerService(imageService)
@@ -267,7 +275,8 @@ func NewKubeGenericRuntimeManager(
 		livenessManager:              livenessManager,
 		readinessManager:             readinessManager,
 		startupManager:               startupManager,
-		machineInfo:                  machineInfo,
+		getMachineInfo:               getMachineInfo,
+		machineID:                    machineInfo.MachineID,
 		osInterface:                  osInterface,
 		runtimeHelper:                runtimeHelper,
 		runtimeService:               runtimeService,
@@ -414,7 +423,7 @@ func (m *kubeGenericRuntimeManager) Version(ctx context.Context) (kubecontainer.
 // runtime. Implementation is expected to update this cache periodically.
 // This may be different from the runtime engine's version.
 func (m *kubeGenericRuntimeManager) APIVersion() (kubecontainer.Version, error) {
-	versionObject, err := m.versionCache.Get(m.machineInfo.MachineID)
+	versionObject, err := m.versionCache.Get(m.machineID)
 	if err != nil {
 		return nil, err
 	}

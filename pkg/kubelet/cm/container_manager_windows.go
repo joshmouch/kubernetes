@@ -17,7 +17,7 @@ limitations under the License.
 */
 
 // containerManagerImpl implements container manager on Windows.
-// Only GetNodeAllocatableReservation() and GetCapacity() are implemented now.
+// Only GetNodeAllocatableReservation(nil) and GetCapacity() are implemented now.
 
 package cm
 
@@ -159,7 +159,7 @@ func NewContainerManager(ctx context.Context, mountUtil mount.Interface, cadviso
 			nodeConfig.CPUManagerReconcilePeriod,
 			machineInfo,
 			nodeConfig.NodeAllocatableConfig.ReservedSystemCPUs,
-			cm.GetNodeAllocatableReservation(),
+			cm.GetNodeAllocatableReservation(nil),
 			nodeConfig.KubeletRootDir,
 			cm.topologyManager,
 		)
@@ -174,7 +174,7 @@ func NewContainerManager(ctx context.Context, mountUtil mount.Interface, cadviso
 			logger,
 			nodeConfig.MemoryManagerPolicy,
 			machineInfo,
-			cm.GetNodeAllocatableReservation(),
+			cm.GetNodeAllocatableReservation(nil),
 			nodeConfig.MemoryManagerReservedMemory,
 			nodeConfig.KubeletRootDir,
 			cm.topologyManager,
@@ -222,10 +222,13 @@ func (cm *containerManagerImpl) Status() Status {
 	return Status{}
 }
 
-func (cm *containerManagerImpl) GetNodeAllocatableReservation() v1.ResourceList {
-	evictionReservation := hardEvictionReservation(cm.nodeConfig.HardEvictionThresholds, cm.capacity)
+func (cm *containerManagerImpl) GetNodeAllocatableReservation(capacity v1.ResourceList) v1.ResourceList {
+	if capacity == nil {
+		capacity = cm.capacity
+	}
+	evictionReservation := hardEvictionReservation(cm.nodeConfig.HardEvictionThresholds, capacity)
 	result := make(v1.ResourceList)
-	for k := range cm.capacity {
+	for k := range capacity {
 		value := resource.NewQuantity(0, resource.DecimalSI)
 		if cm.nodeConfig.SystemReserved != nil {
 			value.Add(cm.nodeConfig.SystemReserved[k])

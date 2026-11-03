@@ -67,21 +67,6 @@ func (cm *containerManagerImpl) createNodeAllocatableCgroups(logger klog.Logger)
 func (cm *containerManagerImpl) enforceNodeAllocatableCgroups(logger klog.Logger) error {
 	nc := cm.NodeConfig.NodeAllocatableConfig
 
-	// We need to update limits on node allocatable cgroup no matter what because
-	// default cpu shares on cgroups are low and can cause cpu starvation.
-	nodeAllocatable := cm.internalCapacity
-	// Use Node Allocatable limits instead of capacity if the user requested enforcing node allocatable.
-	if cm.CgroupsPerQOS && nc.EnforceNodeAllocatable.Has(kubetypes.NodeAllocatableEnforcementKey) {
-		nodeAllocatable = cm.getNodeAllocatableInternalAbsolute()
-	}
-
-	logger.V(4).Info("Attempting to enforce Node Allocatable", "config", nc)
-
-	cgroupConfig := &CgroupConfig{
-		Name:               cm.cgroupRoot,
-		ResourceParameters: cm.getCgroupConfig(nodeAllocatable, false),
-	}
-
 	// Using ObjectReference for events as the node maybe not cached; refer to #42701 for detail.
 	nodeRef := nodeRefFromNode(cm.nodeInfo.Name)
 
@@ -94,7 +79,7 @@ func (cm *containerManagerImpl) enforceNodeAllocatableCgroups(logger klog.Logger
 	if len(cm.cgroupRoot) > 0 {
 		go func() {
 			for {
-				err := cm.cgroupManager.Update(logger, cgroupConfig)
+				err := cm.updateNodeAllocatableCgroup(logger)
 				if err == nil {
 					cm.recorder.Event(nodeRef, v1.EventTypeNormal, events.SuccessfulNodeAllocatableEnforcement, "Updated Node Allocatable limit across pods")
 					return
@@ -276,12 +261,15 @@ func (cm *containerManagerImpl) getNodeAllocatableInternalAbsolute() v1.Resource
 }
 
 // GetNodeAllocatableReservation returns amount of compute or storage resource that have to be reserved on this node from scheduling.
-func (cm *containerManagerImpl) GetNodeAllocatableReservation() v1.ResourceList {
+func (cm *containerManagerImpl) GetNodeAllocatableReservation(capacity v1.ResourceList) v1.ResourceList {
 	cm.RLock()
 	defer cm.RUnlock()
-	evictionReservation := hardEvictionReservation(cm.HardEvictionThresholds, cm.capacity)
+	if capacity == nil {
+		capacity = cm.capacity
+	}
+	evictionReservation := hardEvictionReservation(cm.HardEvictionThresholds, capacity)
 	result := make(v1.ResourceList)
-	for k := range cm.capacity {
+	for k := range capacity {
 		value := resource.NewQuantity(0, resource.DecimalSI)
 		if cm.NodeConfig.SystemReserved != nil {
 			value.Add(cm.NodeConfig.SystemReserved[k])
@@ -303,15 +291,16 @@ func (cm *containerManagerImpl) GetNodeAllocatableReservation() v1.ResourceList 
 // Returns error if the configuration is invalid, nil otherwise.
 func (cm *containerManagerImpl) validateNodeAllocatable() error {
 	cm.RLock()
-	defer cm.RUnlock()
+	capacity := cm.capacity.DeepCopy()
+	cm.RUnlock()
 	var errors []string
-	nar := cm.GetNodeAllocatableReservation()
+	nar := cm.GetNodeAllocatableReservation(capacity)
 	for k, v := range nar {
-		value := cm.capacity[k].DeepCopy()
+		value := capacity[k].DeepCopy()
 		value.Sub(v)
 
 		if value.Sign() < 0 {
-			errors = append(errors, fmt.Sprintf("Resource %q has a reservation of %v but capacity of %v. Expected capacity >= reservation.", k, v, cm.capacity[k]))
+			errors = append(errors, fmt.Sprintf("Resource %q has a reservation of %v but capacity of %v. Expected capacity >= reservation.", k, v, capacity[k]))
 		}
 	}
 
@@ -329,4 +318,21 @@ func nodeRefFromNode(nodeName string) *v1.ObjectReference {
 		Name:       nodeName,
 		Namespace:  "",
 	}
+}
+
+// updateNodeAllocatableCgroup reads accepted capacity on each retry. The shared
+// lock prevents a startup retry from restoring an older limit after a refresh.
+func (cm *containerManagerImpl) updateNodeAllocatableCgroup(logger klog.Logger) error {
+	cm.nodeAllocatableMutex.Lock()
+	defer cm.nodeAllocatableMutex.Unlock()
+	cm.RLock()
+	defer cm.RUnlock()
+	capacity := cm.internalCapacity
+	if cm.CgroupsPerQOS && cm.EnforceNodeAllocatable.Has(kubetypes.NodeAllocatableEnforcementKey) {
+		capacity = cm.getNodeAllocatableInternalAbsolute()
+	}
+	return cm.cgroupManager.Update(logger, &CgroupConfig{
+		Name:               cm.cgroupRoot,
+		ResourceParameters: cm.getCgroupConfig(capacity, false),
+	})
 }

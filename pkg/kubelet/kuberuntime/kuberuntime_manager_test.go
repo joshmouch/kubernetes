@@ -2946,7 +2946,7 @@ func TestComputePodActionsForPodResize(t *testing.T) {
 
 	tCtx := ktesting.Init(t)
 	_, _, m, err := createTestRuntimeManager(tCtx)
-	m.machineInfo.MemoryCapacity = 17179860387 // 16GB
+	machineInfoForTest(t, m).MemoryCapacity = 17179860387 // 16GB
 	assert.NoError(t, err)
 
 	cpu100m := resource.MustParse("100m")
@@ -3849,7 +3849,7 @@ func TestComputePodResizeActionForOOMKilledContainer(t *testing.T) {
 	tCtx := ktesting.Init(t)
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
 	_, _, m, err := createTestRuntimeManager(tCtx)
-	m.machineInfo.MemoryCapacity = 17179860387 // 16GB
+	machineInfoForTest(t, m).MemoryCapacity = 17179860387 // 16GB
 	require.NoError(t, err)
 
 	mem100M := resource.MustParse("100Mi")
@@ -3897,7 +3897,7 @@ func TestComputePodResizeActionForOOMKilledInitContainer(t *testing.T) {
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScalingInitContainers, true)
 	_, _, m, err := createTestRuntimeManager(tCtx)
-	m.machineInfo.MemoryCapacity = 17179860387 // 16GB
+	machineInfoForTest(t, m).MemoryCapacity = 17179860387 // 16GB
 	require.NoError(t, err)
 
 	mem100M := resource.MustParse("100Mi")
@@ -3958,7 +3958,7 @@ func TestComputePodResizeActionForOOMKilledSidecarContainer(t *testing.T) {
 	tCtx := ktesting.Init(t)
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
 	_, _, m, err := createTestRuntimeManager(tCtx)
-	m.machineInfo.MemoryCapacity = 17179860387 // 16GB
+	machineInfoForTest(t, m).MemoryCapacity = 17179860387 // 16GB
 	require.NoError(t, err)
 
 	mem100M := resource.MustParse("100Mi")
@@ -4028,7 +4028,7 @@ func TestUpdatePodContainerResources(t *testing.T) {
 	tCtx := ktesting.Init(t)
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
 	fakeRuntime, _, m, err := createTestRuntimeManager(tCtx)
-	m.machineInfo.MemoryCapacity = 17179860387 // 16GB
+	machineInfoForTest(t, m).MemoryCapacity = 17179860387 // 16GB
 	assert.NoError(t, err)
 
 	cpu100m := resource.MustParse("100m")
@@ -6135,4 +6135,12 @@ func TestOnPodSandboxReadyTiming(t *testing.T) {
 	// verify the final state of pod
 	assert.Len(t, fakeRuntime.Sandboxes, 1, "final sandbox count")
 	assert.Len(t, fakeRuntime.Containers, 1, "final container count")
+}
+
+func machineInfoForTest(t *testing.T, m *kubeGenericRuntimeManager) *cadvisorapi.MachineInfo {
+	t.Helper()
+	info, err := m.getMachineInfo()
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	return info
 }

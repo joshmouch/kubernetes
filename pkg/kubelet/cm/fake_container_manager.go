@@ -118,7 +118,7 @@ func (cm *FakeContainerManager) Status() Status {
 	return Status{}
 }
 
-func (cm *FakeContainerManager) GetNodeAllocatableReservation() v1.ResourceList {
+func (cm *FakeContainerManager) GetNodeAllocatableReservation(capacity v1.ResourceList) v1.ResourceList {
 	cm.Lock()
 	defer cm.Unlock()
 	cm.CalledFunctions = append(cm.CalledFunctions, "GetNodeAllocatableReservation")

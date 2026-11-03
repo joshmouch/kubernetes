@@ -787,7 +787,7 @@ func NewMainKubelet(ctx context.Context,
 		klet.startupManager,
 		rootDirectory,
 		podLogsDirectory,
-		machineInfo,
+		klet.GetCachedMachineInfo,
 		klet.podWorkers,
 		kubeCfg.MaxPods,
 		kubeDeps.OSInterface,
@@ -1384,7 +1384,8 @@ type Kubelet struct {
 	// Manager for container logs.
 	containerLogManager logs.ContainerLogManager
 
-	// Cached MachineInfo returned by cadvisor.
+	// Startup identity and topology from cAdvisor; current physical memory is
+	// supplied by cAdvisor when GetCachedMachineInfo is called.
 	machineInfoLock sync.RWMutex
 	machineInfo     *cadvisorapi.MachineInfo
 

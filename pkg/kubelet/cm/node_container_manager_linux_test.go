@@ -105,7 +105,7 @@ func TestNodeAllocatableReservationForScheduling(t *testing.T) {
 			NodeConfig: nc,
 			capacity:   tc.capacity,
 		}
-		for k, v := range cm.GetNodeAllocatableReservation() {
+		for k, v := range cm.GetNodeAllocatableReservation(nil) {
 			expected, exists := tc.expected[k]
 			assert.True(t, exists, "test case %d expected resource %q", idx+1, k)
 			assert.Equal(t, expected.MilliValue(), v.MilliValue(), "test case %d failed for resource %q", idx+1, k)
@@ -164,7 +164,7 @@ func TestNodeAllocatableReservationForScheduling(t *testing.T) {
 			NodeConfig: nc,
 			capacity:   tc.capacity,
 		}
-		for k, v := range cm.GetNodeAllocatableReservation() {
+		for k, v := range cm.GetNodeAllocatableReservation(nil) {
 			expected, exists := tc.expected[k]
 			assert.True(t, exists, "test case %d expected resource %q", idx+1, k)
 			assert.Equal(t, expected.MilliValue(), v.MilliValue(), "test case %d failed for resource %q", idx+1, k)

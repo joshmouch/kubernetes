@@ -118,6 +118,8 @@ type containerManagerImpl struct {
 	capacity v1.ResourceList
 	// Capacity of this node, including internal resources.
 	internalCapacity v1.ResourceList
+	// Serializes node-allocatable writes with acceptance of refreshed memory.
+	nodeAllocatableMutex sync.Mutex
 	// Absolute cgroupfs path to a cgroup that Kubelet needs to place all pods under.
 	// This path include a top level container for enforcing Node Allocatable.
 	cgroupRoot CgroupName
@@ -332,7 +334,7 @@ func NewContainerManager(ctx context.Context, mountUtil mount.Interface, cadviso
 		nodeConfig.CPUManagerReconcilePeriod,
 		machineInfo,
 		nodeConfig.NodeAllocatableConfig.ReservedSystemCPUs,
-		cm.GetNodeAllocatableReservation(),
+		cm.GetNodeAllocatableReservation(nil),
 		nodeConfig.KubeletRootDir,
 		cm.topologyManager,
 	)
@@ -346,7 +348,7 @@ func NewContainerManager(ctx context.Context, mountUtil mount.Interface, cadviso
 		logger,
 		nodeConfig.MemoryManagerPolicy,
 		machineInfo,
-		cm.GetNodeAllocatableReservation(),
+		cm.GetNodeAllocatableReservation(nil),
 		nodeConfig.MemoryManagerReservedMemory,
 		nodeConfig.KubeletRootDir,
 		cm.topologyManager,
@@ -716,6 +718,11 @@ func (cm *containerManagerImpl) Start(ctx context.Context, node *v1.Node,
 
 	}
 
+	cm.periodicTasks = append(cm.periodicTasks, func() {
+		if err := cm.reconcileMemoryCapacity(logger); err != nil {
+			logger.Error(err, "Failed to reconcile node memory capacity")
+		}
+	})
 	if len(cm.periodicTasks) > 0 {
 		go wait.Until(func() {
 			for _, task := range cm.periodicTasks {
@@ -986,7 +993,7 @@ func (cm *containerManagerImpl) GetCapacity(localStorageCapacityIsolation bool) 
 				if err != nil {
 					logger.Error(err, "Unable to get rootfs data from cAdvisor interface")
 					// If the rootfsinfo retrieval from cAdvisor fails for any reason, fallback to returning the capacity property with no ephemeral storage data
-					return cm.capacity
+					return cm.capacity.DeepCopy()
 				}
 				// We don't want to mutate cm.capacity here so we'll manually construct a v1.ResourceList from it,
 				// and add ephemeral-storage
@@ -999,7 +1006,7 @@ func (cm *containerManagerImpl) GetCapacity(localStorageCapacityIsolation bool) 
 			}
 		}
 	}
-	return cm.capacity
+	return cm.capacity.DeepCopy()
 }
 
 func (cm *containerManagerImpl) GetDevicePluginResourceCapacity() (v1.ResourceList, v1.ResourceList, []string) {
@@ -1147,4 +1154,54 @@ func (cm *containerManagerImpl) UpdateAllocatedResourcesStatus(pod *v1.Pod, stat
 
 func (cm *containerManagerImpl) Updates() <-chan resourceupdates.Update {
 	return cm.resourceUpdates
+}
+
+// reconcileMemoryCapacity composes cAdvisor's existing machine-info refresh with
+// local admission and node-allocatable enforcement. Static memory management owns
+// a checkpointed NUMA allocation contract and retains its configured capacity.
+func (cm *containerManagerImpl) reconcileMemoryCapacity(logger klog.Logger) error {
+	if cm.MemoryManagerPolicy != "None" {
+		return nil
+	}
+	cm.nodeAllocatableMutex.Lock()
+	defer cm.nodeAllocatableMutex.Unlock()
+	info, err := cm.cadvisorInterface.MachineInfo()
+	if err != nil {
+		return fmt.Errorf("get current machine memory: %w", err)
+	}
+	if info == nil || info.MemoryCapacity == 0 || info.MemoryCapacity > uint64(1<<63-1) {
+		return fmt.Errorf("invalid current machine memory capacity")
+	}
+	memory := *resource.NewQuantity(int64(info.MemoryCapacity), resource.BinarySI)
+	cm.Lock()
+	defer cm.Unlock()
+	capacity := cm.capacity.DeepCopy()
+	internalCapacity := cm.internalCapacity.DeepCopy()
+	capacity[v1.ResourceMemory] = memory
+	internalCapacity[v1.ResourceMemory] = memory
+	// A decrease is immediately a lower admission ceiling even if the kernel
+	// cannot yet lower the cgroup limit below resident workload usage. An increase
+	// becomes available only after its cgroup write succeeds.
+	previous := cm.capacity[v1.ResourceMemory]
+	decreased := memory.Cmp(previous) < 0
+	if len(cm.cgroupRoot) > 0 {
+		limit := internalCapacity
+		if cm.CgroupsPerQOS && cm.EnforceNodeAllocatable.Has(kubetypes.NodeAllocatableEnforcementKey) {
+			limit = cm.getNodeAllocatableAbsoluteImpl(internalCapacity)
+		}
+		memoryLimit := limit[v1.ResourceMemory]
+		value := memoryLimit.Value()
+		// Only memory changed. Preserve CPU, hugepage, PID and topology settings.
+		config := &CgroupConfig{Name: cm.cgroupRoot, ResourceParameters: &ResourceConfig{Memory: &value}}
+		if err := cm.cgroupManager.Update(logger, config); err != nil {
+			if decreased {
+				cm.capacity = capacity
+				cm.internalCapacity = internalCapacity
+			}
+			return fmt.Errorf("enforce current node memory: %w", err)
+		}
+	}
+	cm.capacity = capacity
+	cm.internalCapacity = internalCapacity
+	return nil
 }

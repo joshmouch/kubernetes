@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	cadvisorapi "github.com/google/cadvisor/info/v1"
 	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
 	"github.com/opencontainers/cgroups"
 	"github.com/stretchr/testify/assert"
@@ -32,13 +33,17 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/ktesting"
 	kubefeatures "k8s.io/kubernetes/pkg/features"
 	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
 	cmqos "k8s.io/kubernetes/pkg/kubelet/cm/qos"
+	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/mount-utils"
 	"k8s.io/utils/cpuset"
 )
@@ -721,4 +726,128 @@ func TestPodHasExclusiveCPUs(t *testing.T) {
 			assert.Equal(t, tc.expectExclusiveCPUs, result)
 		})
 	}
+}
+
+type memoryCapacityCgroupManager struct {
+	CgroupManager
+	limits []int64
+	fail   bool
+}
+
+func (m *memoryCapacityCgroupManager) Update(_ klog.Logger, config *CgroupConfig) error {
+	m.limits = append(m.limits, *config.ResourceParameters.Memory)
+	if m.fail {
+		m.fail = false
+		return errors.New("memory limit cannot be applied")
+	}
+	return nil
+}
+
+type memoryCapacityCPUManager struct{ cpumanager.Manager }
+
+func (*memoryCapacityCPUManager) GetAllocatableCPUs() cpuset.CPUSet { return cpuset.New() }
+func (*memoryCapacityCPUManager) GetAllCPUs() cpuset.CPUSet         { return cpuset.New() }
+
+func TestReconcileMemoryCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		policy     string
+		current    uint64
+		readError  bool
+		writeError bool
+		want       string
+		wantError  bool
+	}{
+		{name: "grow", policy: "None", current: 24 << 30, want: "24Gi"},
+		{name: "shrink", policy: "None", current: 2 << 30, want: "2Gi"},
+		{name: "growth enforcement failure retains accepted capacity", policy: "None", current: 24 << 30, writeError: true, want: "4Gi", wantError: true},
+		{name: "shrink enforcement failure still lowers admission", policy: "None", current: 2 << 30, writeError: true, want: "2Gi", wantError: true},
+		{name: "provider error", policy: "None", readError: true, want: "4Gi", wantError: true},
+		{name: "zero capacity", policy: "None", want: "4Gi", wantError: true},
+		{name: "overflow", policy: "None", current: 1 << 63, want: "4Gi", wantError: true},
+		{name: "static topology policy remains unchanged", policy: "Static", current: 24 << 30, want: "4Gi"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, _ := ktesting.NewTestContext(t)
+			provider := cadvisortest.NewMockInterface(t)
+			if tc.policy == "None" {
+				var err error
+				if tc.readError {
+					err = errors.New("machine info unavailable")
+				}
+				provider.EXPECT().MachineInfo().Return(&cadvisorapi.MachineInfo{MemoryCapacity: tc.current, NumCores: 128}, err).Once()
+			}
+			groups := &memoryCapacityCgroupManager{fail: tc.writeError}
+			original := v1.ResourceList{v1.ResourceMemory: resource.MustParse("4Gi"), v1.ResourceCPU: resource.MustParse("4"), v1.ResourceName("hugepages-2Mi"): resource.MustParse("8Mi")}
+			cm := &containerManagerImpl{NodeConfig: NodeConfig{MemoryManagerPolicy: tc.policy}, cadvisorInterface: provider, capacity: original.DeepCopy(), internalCapacity: original.DeepCopy(), cgroupRoot: NewCgroupName(RootCgroupName, "kubepods"), cgroupManager: groups}
+			err := cm.reconcileMemoryCapacity(logger)
+			assert.Equal(t, tc.wantError, err != nil)
+			want := resource.MustParse(tc.want)
+			assert.True(t, cm.capacity[v1.ResourceMemory].Equal(want))
+			assert.True(t, cm.internalCapacity[v1.ResourceMemory].Equal(want))
+			assert.True(t, cm.GetNodeAllocatableAbsolute()[v1.ResourceMemory].Equal(want))
+			assert.True(t, cm.capacity[v1.ResourceCPU].Equal(original[v1.ResourceCPU]))
+			assert.True(t, cm.capacity[v1.ResourceName("hugepages-2Mi")].Equal(original[v1.ResourceName("hugepages-2Mi")]))
+			copy := cm.GetCapacity(false)
+			copy[v1.ResourceMemory] = resource.MustParse("1Mi")
+			assert.True(t, cm.GetCapacity(false)[v1.ResourceMemory].Equal(want), "readers must not mutate accepted capacity")
+		})
+	}
+}
+
+func TestNodeAllocatableRetryUsesReconciledMemory(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	provider := cadvisortest.NewMockInterface(t)
+	provider.EXPECT().MachineInfo().Return(&cadvisorapi.MachineInfo{MemoryCapacity: 24 << 30}, nil).Once()
+	groups := &memoryCapacityCgroupManager{fail: true}
+	capacity := v1.ResourceList{v1.ResourceMemory: resource.MustParse("4Gi")}
+	cm := &containerManagerImpl{NodeConfig: NodeConfig{MemoryManagerPolicy: "None"}, cadvisorInterface: provider, capacity: capacity.DeepCopy(), internalCapacity: capacity.DeepCopy(), cgroupRoot: NewCgroupName(RootCgroupName, "kubepods"), cgroupManager: groups, cpuManager: &memoryCapacityCPUManager{}}
+	require.Error(t, cm.updateNodeAllocatableCgroup(logger))
+	require.NoError(t, cm.reconcileMemoryCapacity(logger))
+	require.NoError(t, cm.updateNodeAllocatableCgroup(logger))
+	assert.Equal(t, []int64{4 << 30, 24 << 30, 24 << 30}, groups.limits, "startup retry must not restore the captured boot limit")
+}
+
+func TestReconciledMemoryReservationAndEnforcement(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	provider := cadvisortest.NewMockInterface(t)
+	provider.EXPECT().MachineInfo().Return(&cadvisorapi.MachineInfo{MemoryCapacity: 24 << 30}, nil).Once()
+	groups := &memoryCapacityCgroupManager{}
+	capacity := v1.ResourceList{v1.ResourceMemory: resource.MustParse("4Gi")}
+	cm := &containerManagerImpl{
+		NodeConfig: NodeConfig{MemoryManagerPolicy: "None", CgroupsPerQOS: true, NodeAllocatableConfig: NodeAllocatableConfig{
+			SystemReserved:         v1.ResourceList{v1.ResourceMemory: resource.MustParse("1Gi")},
+			KubeReserved:           v1.ResourceList{v1.ResourceMemory: resource.MustParse("1Gi")},
+			EnforceNodeAllocatable: sets.New(kubetypes.NodeAllocatableEnforcementKey),
+			HardEvictionThresholds: []evictionapi.Threshold{{Signal: evictionapi.SignalMemoryAvailable, Value: evictionapi.ThresholdValue{Percentage: 0.25}}},
+		}},
+		cadvisorInterface: provider, capacity: capacity.DeepCopy(), internalCapacity: capacity.DeepCopy(), cgroupRoot: NewCgroupName(RootCgroupName, "kubepods"), cgroupManager: groups,
+	}
+	require.NoError(t, cm.reconcileMemoryCapacity(logger))
+	assert.Equal(t, []int64{22 << 30}, groups.limits)
+	assert.True(t, cm.GetNodeAllocatableAbsolute()[v1.ResourceMemory].Equal(resource.MustParse("22Gi")))
+	assert.True(t, cm.GetNodeAllocatableReservation(nil)[v1.ResourceMemory].Equal(resource.MustParse("8Gi")), "percentage eviction reservation must use accepted memory")
+}
+
+func TestMemoryCapacityRetriesFailedEnforcement(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	provider := cadvisortest.NewMockInterface(t)
+	provider.EXPECT().MachineInfo().Return(&cadvisorapi.MachineInfo{MemoryCapacity: 24 << 30}, nil).Twice()
+	groups := &memoryCapacityCgroupManager{fail: true}
+	capacity := v1.ResourceList{v1.ResourceMemory: resource.MustParse("4Gi")}
+	cm := &containerManagerImpl{NodeConfig: NodeConfig{MemoryManagerPolicy: "None"}, cadvisorInterface: provider, capacity: capacity.DeepCopy(), internalCapacity: capacity.DeepCopy(), cgroupRoot: NewCgroupName(RootCgroupName, "kubepods"), cgroupManager: groups}
+	require.Error(t, cm.reconcileMemoryCapacity(logger))
+	assert.True(t, cm.GetCapacity(false)[v1.ResourceMemory].Equal(resource.MustParse("4Gi")))
+	require.NoError(t, cm.reconcileMemoryCapacity(logger))
+	assert.True(t, cm.GetCapacity(false)[v1.ResourceMemory].Equal(resource.MustParse("24Gi")))
+	assert.Equal(t, []int64{24 << 30, 24 << 30}, groups.limits)
+}
+
+func TestMemoryReservationUsesProvidedSnapshot(t *testing.T) {
+	cm := &containerManagerImpl{NodeConfig: NodeConfig{NodeAllocatableConfig: NodeAllocatableConfig{HardEvictionThresholds: []evictionapi.Threshold{{Signal: evictionapi.SignalMemoryAvailable, Value: evictionapi.ThresholdValue{Percentage: 0.25}}}}}, capacity: v1.ResourceList{v1.ResourceMemory: resource.MustParse("24Gi")}}
+	previous := v1.ResourceList{v1.ResourceMemory: resource.MustParse("4Gi")}
+	assert.True(t, cm.GetNodeAllocatableReservation(previous)[v1.ResourceMemory].Equal(resource.MustParse("1Gi")))
+	assert.True(t, cm.GetNodeAllocatableReservation(nil)[v1.ResourceMemory].Equal(resource.MustParse("6Gi")))
+	cm.capacity = v1.ResourceList{v1.ResourceMemory: resource.MustParse("2Gi")}
+	assert.True(t, cm.GetNodeAllocatableReservation(previous)[v1.ResourceMemory].Equal(resource.MustParse("1Gi")), "shrink cannot mix the projected capacity with a newer reservation")
 }

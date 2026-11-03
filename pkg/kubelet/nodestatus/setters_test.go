@@ -926,7 +926,7 @@ func TestMachineInfo(t *testing.T) {
 				c := tc.devicePluginResourceCapacity
 				return c.capacity, c.allocatable, c.inactive
 			}
-			nodeAllocatableReservationFunc := func() v1.ResourceList {
+			nodeAllocatableReservationFunc := func(v1.ResourceList) v1.ResourceList {
 				return tc.nodeAllocatableReservation
 			}
 
@@ -1954,4 +1954,57 @@ func makeDiskPressureCondition(pressure bool, transition, heartbeat time.Time) *
 		LastTransitionTime: metav1.NewTime(transition),
 		LastHeartbeatTime:  metav1.NewTime(heartbeat),
 	}
+}
+
+func TestMachineInfoUsesAcceptedContainerManagerMemory(t *testing.T) {
+	ctx := ktesting.Init(t)
+	physical := &cadvisorapiv1.MachineInfo{MemoryCapacity: 4 << 30, NumCores: 2}
+	accepted := resource.MustParse("8Gi")
+	var reservationInputs []int64
+	setter := MachineInfo("test-node", 110, 0,
+		func() (*cadvisorapiv1.MachineInfo, error) { return physical, nil },
+		func(bool) v1.ResourceList {
+			snapshot := accepted.DeepCopy()
+			accepted = resource.MustParse("24Gi")
+			return v1.ResourceList{v1.ResourceMemory: snapshot}
+		},
+		func() (v1.ResourceList, v1.ResourceList, []string) { return nil, nil, nil },
+		func(capacity v1.ResourceList) v1.ResourceList {
+			memory := capacity[v1.ResourceMemory]
+			reservationInputs = append(reservationInputs, memory.Value())
+			return v1.ResourceList{v1.ResourceMemory: *resource.NewQuantity(memory.Value()/4, resource.BinarySI)}
+		},
+		func(string, string, string) {}, false)
+	node := &v1.Node{}
+	require.NoError(t, setter(ctx, node))
+	assert.True(t, node.Status.Capacity[v1.ResourceMemory].Equal(resource.MustParse("8Gi")))
+	assert.True(t, node.Status.Allocatable[v1.ResourceMemory].Equal(resource.MustParse("6Gi")))
+	require.NoError(t, setter(ctx, node))
+	assert.True(t, node.Status.Capacity[v1.ResourceMemory].Equal(resource.MustParse("24Gi")))
+	assert.True(t, node.Status.Allocatable[v1.ResourceMemory].Equal(resource.MustParse("18Gi")))
+	assert.True(t, node.Status.Capacity[v1.ResourceCPU].Equal(resource.MustParse("2")))
+	assert.Equal(t, []int64{8 << 30, 24 << 30}, reservationInputs, "reservation must consume the advertised snapshot, not the independently refreshed live capacity")
+}
+
+func TestMachineInfoAcceptedMemorySurvivesPhysicalProviderFailure(t *testing.T) {
+	ctx := ktesting.Init(t)
+	var reservationInput int64
+	setter := MachineInfo("test-node", 110, 0,
+		func() (*cadvisorapiv1.MachineInfo, error) {
+			return nil, errors.New("physical machine information unavailable")
+		},
+		func(bool) v1.ResourceList { return v1.ResourceList{v1.ResourceMemory: resource.MustParse("8Gi")} },
+		func() (v1.ResourceList, v1.ResourceList, []string) { return nil, nil, nil },
+		func(capacity v1.ResourceList) v1.ResourceList {
+			memory := capacity[v1.ResourceMemory]
+			reservationInput = memory.Value()
+			return v1.ResourceList{v1.ResourceMemory: resource.MustParse("2Gi")}
+		},
+		func(string, string, string) {}, false)
+	node := &v1.Node{}
+	require.NoError(t, setter(ctx, node))
+	assert.True(t, node.Status.Capacity[v1.ResourceMemory].Equal(resource.MustParse("8Gi")))
+	assert.True(t, node.Status.Allocatable[v1.ResourceMemory].Equal(resource.MustParse("6Gi")))
+	assert.Equal(t, int64(8<<30), reservationInput)
+	assert.True(t, node.Status.Capacity[v1.ResourceCPU].IsZero(), "preserve the existing CPU failure semantics")
 }

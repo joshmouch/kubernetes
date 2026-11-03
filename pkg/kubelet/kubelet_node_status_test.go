@@ -56,6 +56,7 @@ import (
 	"k8s.io/component-base/version"
 	kubeletapis "k8s.io/kubelet/pkg/apis"
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
@@ -156,7 +157,7 @@ type localCM struct {
 	capacity               v1.ResourceList
 }
 
-func (lcm *localCM) GetNodeAllocatableReservation() v1.ResourceList {
+func (lcm *localCM) GetNodeAllocatableReservation(capacity v1.ResourceList) v1.ResourceList {
 	return lcm.allocatableReservation
 }
 
@@ -247,7 +248,7 @@ func TestUpdateNewNodeStatus(t *testing.T) {
 				NumCores:       2,
 				MemoryCapacity: 10e9, // 10G
 			}
-			kubelet.setCachedMachineInfo(machineInfo)
+			setMachineInfoForTest(kubelet, machineInfo)
 
 			expectedNode := &v1.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: testKubeletHostname, Labels: map[string]string{v1.LabelOSStable: goruntime.GOOS, v1.LabelArchStable: goruntime.GOARCH}},
@@ -427,7 +428,7 @@ func TestUpdateExistingNodeStatus(t *testing.T) {
 		NumCores:       2,
 		MemoryCapacity: 20e9,
 	}
-	kubelet.setCachedMachineInfo(machineInfo)
+	setMachineInfoForTest(kubelet, machineInfo)
 
 	expectedNode := &v1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: testKubeletHostname, Labels: map[string]string{v1.LabelOSStable: goruntime.GOOS, v1.LabelArchStable: goruntime.GOARCH}},
@@ -640,7 +641,7 @@ func TestUpdateNodeStatusWithRuntimeStateError(t *testing.T) {
 		NumCores:       2,
 		MemoryCapacity: 10e9,
 	}
-	kubelet.setCachedMachineInfo(machineInfo)
+	setMachineInfoForTest(kubelet, machineInfo)
 
 	expectedNode := &v1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: testKubeletHostname, Labels: map[string]string{v1.LabelOSStable: goruntime.GOOS, v1.LabelArchStable: goruntime.GOARCH}},
@@ -866,7 +867,7 @@ func TestUpdateNodeStatusWithLease(t *testing.T) {
 		NumCores:       2,
 		MemoryCapacity: 20e9,
 	}
-	kubelet.setCachedMachineInfo(machineInfo)
+	setMachineInfoForTest(kubelet, machineInfo)
 
 	now := metav1.NewTime(clock.Now()).Rfc3339Copy()
 	expectedNode := &v1.Node{
@@ -1017,7 +1018,8 @@ func TestUpdateNodeStatusWithLease(t *testing.T) {
 	}
 	newMachineInfo := oldMachineInfo.Clone()
 	newMachineInfo.MemoryCapacity = uint64(newMemoryCapacity)
-	kubelet.setCachedMachineInfo(newMachineInfo)
+	setMachineInfoForTest(kubelet, newMachineInfo)
+	kubelet.containerManager.(*localCM).capacity[v1.ResourceMemory] = *resource.NewQuantity(int64(newMachineInfo.MemoryCapacity), resource.BinarySI)
 	require.NoError(t, kubelet.updateNodeStatus(tCtx))
 
 	// 2 more action (There were 5 actions before).
@@ -1129,7 +1131,7 @@ func TestUpdateNodeStatusAndVolumesInUseWithNodeLease(t *testing.T) {
 			kubelet.containerManager = &localCM{ContainerManager: cm.NewStubContainerManager()}
 			kubelet.lastStatusReportTime = kubelet.clock.Now()
 			kubelet.nodeStatusReportFrequency = time.Hour
-			kubelet.setCachedMachineInfo(&cadvisorapi.MachineInfo{})
+			setMachineInfoForTest(kubelet, &cadvisorapi.MachineInfo{})
 
 			// override test volumeManager
 			fakeVolumeManager := kubeletvolume.NewFakeVolumeManager(tc.existingVolumes, 0, nil, false)
@@ -1371,7 +1373,7 @@ func TestRegisterWithApiServer(t *testing.T) {
 		NumCores:       2,
 		MemoryCapacity: 1024,
 	}
-	kubelet.setCachedMachineInfo(machineInfo)
+	setMachineInfoForTest(kubelet, machineInfo)
 
 	done := make(chan struct{})
 	go func() {
@@ -1622,7 +1624,7 @@ func TestUpdateNewNodeStatusTooLargeReservation(t *testing.T) {
 		NumCores:       2,
 		MemoryCapacity: 10e9, // 10G
 	}
-	kubelet.setCachedMachineInfo(machineInfo)
+	setMachineInfoForTest(kubelet, machineInfo)
 
 	expectedNode := &v1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: testKubeletHostname},
@@ -2756,7 +2758,7 @@ func TestRegisterWithApiServerWithTaint(t *testing.T) {
 		NumCores:       2,
 		MemoryCapacity: 1024,
 	}
-	kubelet.setCachedMachineInfo(machineInfo)
+	setMachineInfoForTest(kubelet, machineInfo)
 
 	var gotNode runtime.Object
 	kubeClient.AddReactor("create", "nodes", func(action core.Action) (bool, runtime.Object, error) {
@@ -3211,7 +3213,7 @@ func TestSetNodeStatusDeclaredFeatures(t *testing.T) {
 			kubeClient.ReactionChain = fake.NewClientset(&v1.NodeList{Items: []v1.Node{existingNode}}).ReactionChain
 			kubelet.nodeLister = delegatingNodeLister{client: kubeClient}
 			machineInfo := &cadvisorapi.MachineInfo{}
-			kubelet.setCachedMachineInfo(machineInfo)
+			setMachineInfoForTest(kubelet, machineInfo)
 
 			// We need to force a status update, so we make the last status report time old.
 			kubelet.lastStatusReportTime = time.Now().Add(-time.Hour)
@@ -3229,4 +3231,50 @@ func TestSetNodeStatusDeclaredFeatures(t *testing.T) {
 			assert.Equal(t, tc.expectedFeatures, updatedNode.Status.DeclaredFeatures)
 		})
 	}
+}
+
+type machineInfoTestCadvisor struct {
+	cadvisor.Interface
+	info *cadvisorapi.MachineInfo
+	err  error
+}
+
+func (c *machineInfoTestCadvisor) MachineInfo() (*cadvisorapi.MachineInfo, error) {
+	if c.err != nil {
+		return nil, c.err
+	}
+	return c.info.Clone(), nil
+}
+
+func setMachineInfoForTest(kl *Kubelet, info *cadvisorapi.MachineInfo) {
+	kl.setCachedMachineInfo(info)
+	kl.cadvisor = &machineInfoTestCadvisor{Interface: kl.cadvisor, info: info}
+}
+
+func TestMachineInfoUsesCadvisorRefresh(t *testing.T) {
+	testKubelet := newTestKubelet(t, false)
+	defer testKubelet.Cleanup()
+	kl := testKubelet.kubelet
+	first := &cadvisorapi.MachineInfo{MemoryCapacity: 4 << 30, NumCores: 2, Timestamp: time.Now(), HugePages: []cadvisorapi.HugePagesInfo{{PageSize: 2048, NumPages: 4}}, Topology: []cadvisorapi.Node{{Id: 0, Memory: 4 << 30}}}
+	setMachineInfoForTest(kl, first)
+	a, err := kl.GetCachedMachineInfo()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(4<<30), a.MemoryCapacity)
+	assert.True(t, a.Timestamp.IsZero())
+	assert.False(t, first.Timestamp.IsZero(), "metric projection must not mutate cAdvisor")
+	second := first.Clone()
+	second.MemoryCapacity = 24 << 30
+	second.NumCores = 128
+	second.HugePages = nil
+	second.Topology = nil
+	kl.cadvisor.(*machineInfoTestCadvisor).info = second
+	b, err := kl.GetCachedMachineInfo()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(24<<30), b.MemoryCapacity)
+	assert.Equal(t, first.NumCores, b.NumCores)
+	assert.Equal(t, first.HugePages, b.HugePages)
+	assert.Equal(t, first.Topology, b.Topology)
+	kl.cadvisor.(*machineInfoTestCadvisor).err = fmt.Errorf("machine info unavailable")
+	_, err = kl.GetCachedMachineInfo()
+	require.ErrorContains(t, err, "machine info unavailable")
 }

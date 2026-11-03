@@ -20,6 +20,7 @@ package kuberuntime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	cadvisorv1 "github.com/google/cadvisor/info/v1"
 	libcontainercgroups "github.com/opencontainers/cgroups"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1146,7 +1148,7 @@ func TestGenerateLinuxContainerResources(t *testing.T) {
 	tCtx := ktesting.Init(t)
 	_, _, m, err := createTestRuntimeManager(tCtx)
 	assert.NoError(t, err)
-	m.machineInfo.MemoryCapacity = 17179860387 // 16GB
+	machineInfoForTest(t, m).MemoryCapacity = 17179860387 // 16GB
 
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1229,7 +1231,8 @@ func TestGenerateLinuxContainerResources(t *testing.T) {
 
 			m.singleProcessOOMKill = ptr.To(tc.singleProcessOOMKill)
 
-			resources := m.generateLinuxContainerResources(tCtx, pod, &pod.Spec.Containers[0], false)
+			resources, err := m.generateLinuxContainerResources(tCtx, pod, &pod.Spec.Containers[0], false)
+			require.NoError(t, err)
 			tc.expected.HugepageLimits = resources.HugepageLimits
 			assert.Equal(t, tc.expected, resources)
 		})
@@ -1364,8 +1367,8 @@ func TestGenerateLinuxContainerResourcesWithSwap(t *testing.T) {
 	tCtx := ktesting.Init(t)
 	_, _, m, err := createTestRuntimeManager(tCtx)
 	assert.NoError(t, err)
-	m.machineInfo.MemoryCapacity = 42949672960 // 40Gb == 40 * 1024^3
-	m.machineInfo.SwapCapacity = 5368709120    // 5Gb == 5 * 1024^3
+	machineInfoForTest(t, m).MemoryCapacity = 42949672960 // 40Gb == 40 * 1024^3
+	machineInfoForTest(t, m).SwapCapacity = 5368709120    // 5Gb == 5 * 1024^3
 
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1424,7 +1427,7 @@ func TestGenerateLinuxContainerResourcesWithSwap(t *testing.T) {
 	}
 
 	calcSwapForBurstablePods := func(containerMemoryRequest int64) int64 {
-		swapSize, err := calcSwapForBurstablePods(containerMemoryRequest, int64(m.machineInfo.MemoryCapacity), int64(m.machineInfo.SwapCapacity))
+		swapSize, err := calcSwapForBurstablePods(containerMemoryRequest, int64(machineInfoForTest(t, m).MemoryCapacity), int64(machineInfoForTest(t, m).SwapCapacity))
 		assert.NoError(t, err)
 
 		return swapSize
@@ -1629,8 +1632,10 @@ func TestGenerateLinuxContainerResourcesWithSwap(t *testing.T) {
 				assert.True(t, types.IsCriticalPod(pod), "pod is expected to be critical")
 			}
 
-			resourcesC1 := m.generateLinuxContainerResources(tCtx, pod, &pod.Spec.Containers[0], false)
-			resourcesC2 := m.generateLinuxContainerResources(tCtx, pod, &pod.Spec.Containers[1], false)
+			resourcesC1, err := m.generateLinuxContainerResources(tCtx, pod, &pod.Spec.Containers[0], false)
+			require.NoError(t, err)
+			resourcesC2, err := m.generateLinuxContainerResources(tCtx, pod, &pod.Spec.Containers[1], false)
+			require.NoError(t, err)
 
 			if tc.swapDisabledOnNode {
 				expectSwapDisabled(tc.cgroupVersion, resourcesC1, resourcesC2)
@@ -2115,4 +2120,25 @@ func setCgroupVersionDuringTest(version CgroupVersion) {
 	isCgroup2UnifiedMode = func() bool {
 		return version == cgroupV2
 	}
+}
+
+func TestContainerResourceCalculationUsesCurrentMachineInfo(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	_, _, m, err := createTestRuntimeManager(tCtx)
+	require.NoError(t, err)
+	info := &cadvisorv1.MachineInfo{MemoryCapacity: 4 << 30}
+	calls := 0
+	m.getMachineInfo = func() (*cadvisorv1.MachineInfo, error) { calls++; return info.Clone(), nil }
+	pod := &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{{Name: "burstable", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceMemory: resource.MustParse("512Mi")}}}}}}
+	before, err := m.generateLinuxContainerResources(tCtx, pod, &pod.Spec.Containers[0], false)
+	require.NoError(t, err)
+	info.MemoryCapacity = 24 << 30
+	after, err := m.generateLinuxContainerResources(tCtx, pod, &pod.Spec.Containers[0], false)
+	require.NoError(t, err)
+	assert.NotEqual(t, before.OomScoreAdj, after.OomScoreAdj, "OOM calculation must not retain boot memory")
+	assert.Equal(t, 2, calls, "one physical information snapshot per resource calculation")
+	m.getMachineInfo = func() (*cadvisorv1.MachineInfo, error) { return nil, errors.New("machine information unavailable") }
+	result, err := m.generateContainerResources(tCtx, pod, &pod.Spec.Containers[0])
+	require.ErrorContains(t, err, "machine information unavailable")
+	assert.Nil(t, result, "resource update must not silently use boot capacity")
 }

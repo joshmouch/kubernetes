@@ -89,8 +89,9 @@ type ContainerManager interface {
 	// GetQOSContainersInfo returns the names of top level QoS containers
 	GetQOSContainersInfo() QOSContainersInfo
 
-	// GetNodeAllocatableReservation returns the amount of compute resources that have to be reserved from scheduling.
-	GetNodeAllocatableReservation() v1.ResourceList
+	// GetNodeAllocatableReservation calculates reservations for the supplied capacity snapshot.
+	// A nil snapshot selects the current container-manager capacity.
+	GetNodeAllocatableReservation(capacity v1.ResourceList) v1.ResourceList
 
 	// GetCapacity returns the amount of compute resources tracked by container manager available on the node.
 	GetCapacity(localStorageCapacityIsolation bool) v1.ResourceList

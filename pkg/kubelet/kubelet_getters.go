@@ -22,6 +22,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	cadvisorapiv1 "github.com/google/cadvisor/info/v1"
 	cadvisorv2 "github.com/google/cadvisor/info/v2"
@@ -458,11 +459,30 @@ func (kl *Kubelet) GetVersionInfo() (*cadvisorapiv1.VersionInfo, error) {
 	return kl.cadvisor.VersionInfo()
 }
 
-// GetCachedMachineInfo assumes that the machine info can't change without a reboot
+// GetCachedMachineInfo preserves startup identity/topology while reading current
+// physical memory from cAdvisor, which already owns periodic machine-info refresh.
 func (kl *Kubelet) GetCachedMachineInfo() (*cadvisorapiv1.MachineInfo, error) {
+	info, err := kl.cadvisor.MachineInfo()
+	if err != nil {
+		return nil, err
+	}
+	if info == nil {
+		return nil, fmt.Errorf("cAdvisor returned no machine information")
+	}
+	// Keep the metric timestamp behavior from PRs #95210 and #97006 without
+	// changing the cAdvisor-owned object.
 	kl.machineInfoLock.RLock()
-	defer kl.machineInfoLock.RUnlock()
-	return kl.machineInfo, nil
+	if kl.machineInfo == nil {
+		kl.machineInfoLock.RUnlock()
+		return nil, fmt.Errorf("startup machine information is unavailable")
+	}
+	startup := kl.machineInfo.Clone()
+	kl.machineInfoLock.RUnlock()
+	startup.MemoryCapacity = info.MemoryCapacity
+	startup.SwapCapacity = info.SwapCapacity
+	info = startup
+	info.Timestamp = time.Time{}
+	return info, nil
 }
 
 func (kl *Kubelet) setCachedMachineInfo(info *cadvisorapiv1.MachineInfo) {
